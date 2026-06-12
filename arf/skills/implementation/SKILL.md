@@ -4,7 +4,7 @@ description: "Execute `plan/plan.md`, produce assets, and verify results."
 ---
 # Implementation
 
-**Version**: 8
+**Version**: 11
 
 ## Goal
 
@@ -67,6 +67,29 @@ Read before starting:
    `from tasks.t0012_other_task.code.module import func`). The only cross-task import mechanism is
    libraries registered in `assets/library/`. Non-library code from other tasks must be copied into
    the current task's `code/` directory and adapted as needed.
+
+9. **Liveness contract.** While a step is `in_progress`, keep `step_tracker.json` heart-beating via
+   `arf.scripts.utils.heartbeat.write_heartbeat` at the `heartbeat_interval_seconds` cadence. When
+   the implementation must wait (engine load, long benchmark, multi-hour training), choose one of:
+   * **(a) drive the wait synchronously** and continue beating;
+   * **(b) transition to `blocked_intervention`** with a written intervention file; or
+   * **(c) pause and resume from files** — call `arf.scripts.utils.heartbeat.pause_step` (CLI:
+     `heartbeat pause <task_id> <step> --resume-sentinel "<what to re-check, e.g. ~/VLLM_READY_AT on vast 12345>" --resume-after <ISO> --watchdog-active`),
+     then return control. This sets the step to `paused_waiting` and clears the owner;
+     `execute-task` Phase −1 re-dispatches `/implementation` once `resume_after` passes, and you
+     re-check the sentinel and either finish or pause again. Option (c) avoids holding a warm
+     context idle across a long GPU wait, but is permitted **ONLY when the VM carries the idle
+     dead-man's-switch watchdog** (setup-remote-machine `--enable-idle-watchdog` for vast;
+     service-account self-stop for nebius; Azure IdleShutdown) — `pause_step` refuses without
+     `watchdog_active`, and `verify_step_liveness` flags an unprotected pause as `ST-E008`. That
+     watchdog is the money safety net that makes ending the session safe: a missed wakeup cannot
+     leave the box billing.
+
+   A blind background poller that leaves the step `in_progress` with no watchdog is still forbidden
+   — that is the fire-and-forget pattern that produced the 9-hour idle billing incident in
+   `LESSONS.md` Lesson 9. The orchestrator scans liveness on every wakeup via
+   `verify_step_liveness`; ghosted in-progress steps are flagged ST-E007 / ST-W005 / ST-W006, and
+   unprotected pauses ST-E008.
 
 ## Steps
 

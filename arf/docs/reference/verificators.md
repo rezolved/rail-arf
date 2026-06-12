@@ -48,6 +48,7 @@ Each one returns structured diagnostics with codes. Errors block step completion
 | [`verify_research_internet.py`](../../scripts/verificators/verify_research_internet.py) | RI | `research/research_internet.md` structure and sections |
 | [`verify_research_papers.py`](../../scripts/verificators/verify_research_papers.py) | RP | `research/research_papers.md` structure and sections |
 | [`verify_step.py`](../../scripts/verificators/verify_step.py) | SV | A single task step against the step specification |
+| [`verify_step_liveness.py`](../../scripts/verificators/verify_step_liveness.py) | ST | `in_progress` step heartbeats and expected-completion estimates across all tasks |
 | [`verify_suggestions.py`](../../scripts/verificators/verify_suggestions.py) | SG | `suggestions.json` files against the suggestions specification |
 | [`verify_task_complete.py`](../../scripts/verificators/verify_task_complete.py) | TC | Overall task completion readiness |
 | [`verify_task_dependencies.py`](../../scripts/verificators/verify_task_dependencies.py) | TD | Task dependency existence, status, and corrections |

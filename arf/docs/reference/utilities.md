@@ -15,6 +15,9 @@ Helper scripts for task execution. They live in `arf/scripts/utils/`.
 | [`find_similar_papers.py`](../../scripts/utils/find_similar_papers.py) | Find similar papers across the corpus for deduplication |
 | [`capture_task_sessions.py`](../../scripts/utils/capture_task_sessions.py) | Capture CLI session transcripts for a task |
 | [`skip_step.py`](../../scripts/utils/skip_step.py) | Mark steps as skipped and create their step logs |
+| [`heartbeat.py`](../../scripts/utils/heartbeat.py) | Maintain step-tracker liveness fields (`start_step`, `write_heartbeat`, `complete_step`) for any owner of an `in_progress` step |
+| [`ssh_health_probe.py`](../../scripts/utils/ssh_health_probe.py) | Shared read-only SSH health probe (`probe()` → `SshHealthReport`) used by setup-remote-machine smoke gate and diagnose-stuck-step |
+| [`watchdog_provisioning.py`](../../scripts/utils/watchdog_provisioning.py) | Render the `idle_watchdog.sh` GPU-idle dead-man's switch into a provider startup hook (vast.ai `onstart`, nebius cloud-init) so a stranded VM self-terminates instead of billing |
 
 ## CLI Usage
 
@@ -77,3 +80,37 @@ uv run python -m arf.scripts.utils.capture_task_sessions --task-id <task_id>
 uv run python -m arf.scripts.utils.skip_step <task_id> <step_id> "<reason>" \
     [<step_id> "<reason>" ...]
 ```
+
+### heartbeat
+
+```bash
+uv run python -m arf.scripts.utils.heartbeat start <task_id> <step_number> <owner> \
+    --interval-seconds 300 --expected-completion-at 2026-05-20T12:00:00Z
+uv run python -m arf.scripts.utils.heartbeat write <task_id> <step_number> <owner>
+uv run python -m arf.scripts.utils.heartbeat complete <task_id> <step_number>
+```
+
+The library API exposes `start_step`, `write_heartbeat`, and `complete_step` for use directly inside
+long-running Python steps. See `arf/specifications/step_tracker_specification.md` for the v2
+liveness fields these helpers write.
+
+### ssh_health_probe
+
+Library-only (no CLI; the only callers are `setup-remote-machine` Phase 4 and the
+`/diagnose-stuck-step` skill):
+
+```python
+from arf.scripts.utils.ssh_health_probe import probe
+
+report = probe(
+    ssh_host="vm.example",
+    ssh_port=22,
+    ssh_user="azureuser",
+    engine_url="http://localhost:8000",
+    log_path="/home/azureuser/engine.log",
+)
+```
+
+Returns a frozen `SshHealthReport` dataclass with `ssh_reachable`, `tmux_sessions`,
+`gpu_utilization_percent`, `gpu_memory_used_mb`, `engine_health_ok`, `engine_completion_ok`,
+`recent_log_tail`, and `error`. Read-only; never mutates the remote machine.

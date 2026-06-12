@@ -4,7 +4,7 @@ description: "Run an ARF task through all required stages and merge the final PR
 ---
 # Execute Task
 
-**Version**: 20
+**Version**: 22
 
 ## Goal
 
@@ -207,6 +207,72 @@ Do NOT run prestep or poststep for skipped steps. Commit all skipped step logs *
 prestep for the next active step — prestep requires a clean working tree.
 
 ## Steps
+
+### Phase −1: Wakeup begins with a liveness scan
+
+This phase runs at the very start of every invocation of `execute-task`, including the first one on
+a fresh task, every resume from `/loop` or `ScheduleWakeup`, and every continuation after a subagent
+handoff. It must execute before any other phase.
+
+1. Run the liveness verificator:
+
+   ```bash
+   uv run python -m arf.scripts.verificators.verify_step_liveness --all
+   ```
+
+   Exit code `0` means no stuck step was detected — proceed to step 5 (resume scan).
+
+2. If the verificator returns non-zero, a step needs recovery before any new work. Two error codes
+   can appear:
+
+   * `ST-E007` — an `in_progress` step has a stale heartbeat AND a live VM is still provisioned: the
+     idle-billing emergency.
+   * `ST-E008` — a `paused_waiting` step has `watchdog_active != true`: an unsafe pause. Either
+     confirm/install the idle watchdog and set `watchdog_active`, or drive the step synchronously /
+     transition it to `blocked_intervention`. Never leave a step paused without a watchdog.
+
+   Do not continue with Phase 0. Instead:
+
+   * Identify the offending `task_id` and `step_number` from the verificator output.
+   * Invoke `/diagnose-stuck-step` inline (do NOT delegate to a fresh subagent — the orchestrator
+     owns the recovery) with that `task_id` and `step_number`. The skill produces a structured
+     report at `tasks/<task_id>/logs/diagnostics/<timestamp>_<step>.json` and prints its path.
+   * Read the diagnostic report. Act on its `recommended_action`:
+     * `resume_inline` — drive the stuck step's work inline (no new subagent), then mark it
+       completed via `arf.scripts.utils.heartbeat.complete_step`.
+     * `teardown_and_restart` — invoke the teardown step from `setup-remote-machine`, then either
+       restart the work inline or transition the step to `blocked_intervention` with a written
+       intervention file describing the failure and what the human should look at.
+     * `intervention_required` — transition the step to `blocked_intervention` with the diagnostic
+       report path referenced.
+
+3. Warnings only (`ST-W005` or `ST-W006` without `ST-E007`): there is no live VM burning money, but
+   a step is ghosted or pathologically slow. Run `/diagnose-stuck-step` inline as above, then act on
+   the report. The cost pressure is lower but the orchestrator still owns the recovery.
+
+4. After acting on every flagged step, re-run `verify_step_liveness --all`. Only when it returns `0`
+   may the orchestrator proceed to step 5.
+
+5. Resume paused steps. Scan every `step_tracker.json` for steps with status `paused_waiting`. These
+   pass the liveness verificator (their VM is watchdog-protected), so they do **not** appear in step
+   1's output — the orchestrator must find them explicitly. For each, in task order:
+
+   * If `now < resume_after`: the wait is not over. Register one `ScheduleWakeup` for the earliest
+     `resume_after` across all paused steps and STOP this invocation — do not start Phase 0 work.
+     The VM's idle watchdog protects spend in the meantime.
+   * If `now >= resume_after`: re-dispatch the step's skill (e.g. `/implementation`) in resume mode
+     — spawn its subagent, passing the step's `resume_sentinel` and instructions to re-check it. The
+     skill then either drives the step to a terminal state or calls `pause_step` again with a new
+     `resume_after`.
+
+   Only when no `paused_waiting` step remains pending resume may the orchestrator proceed to Phase
+   0\.
+
+Critical rule: NEVER re-delegate **recovery** (ghosted/emergency steps from steps 2-3) to a fresh
+subagent — drive it inline (the failure mode behind the 9-hour idle incident, `LESSONS.md` Lesson
+9). This is distinct from the sanctioned **resume** path in step 5: a `paused_waiting` step on a
+watchdog-protected VM may legitimately end the session and resume on a scheduled wakeup, because the
+watchdog — not the orchestrator — is what guarantees the VM cannot run away.
 
 ### Phase 0: Preparation (before any steps)
 

@@ -17,6 +17,7 @@ Format: `arf/specifications/agent_skills_specification.md`.
 | [create-dedup-task](../../skills/create-dedup-task/SKILL.md) | Create a deduplication checkpoint task that scans for duplicate papers and overlapping work. | `tasks/<task_id>/` (dedup) |
 | [create-project-description](../../skills/create-project-description/SKILL.md) | Guide creation of `project/description.md` and `project/budget.json` for a new or revised ARF project. | `project/description.md`, `project/budget.json` |
 | [create-task](../../skills/create-task/SKILL.md) | Create a new not-started task folder with task.json and task_description.md. | `tasks/<task_id>/task.json`, `task_description.md` |
+| [diagnose-stuck-step](../../skills/diagnose-stuck-step/SKILL.md) | Read-only, time-boxed diagnostic for a flagged stuck step; produces a structured JSON report informing the orchestrator's recovery decision. | `tasks/<task_id>/logs/diagnostics/<timestamp>_<step>.json` |
 | [download_paper](../../skills/download_paper/SKILL.md) | Resolve paper identifiers, fetch the PDF and metadata, and prepare inputs for paper asset creation. | Downloaded PDF and metadata |
 | [execute-task](../../skills/execute-task/SKILL.md) | Run an ARF task through all required stages and merge the final PR. | Merged PR, completed task |
 | [generate-daily-news](../../skills/generate-daily-news/SKILL.md) | Generate a daily project summary with structured news files. | `news/<date>.md`, `news/<date>.json` |
