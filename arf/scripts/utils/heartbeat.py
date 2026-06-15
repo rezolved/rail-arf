@@ -195,13 +195,13 @@ def pause_step(
     orchestrator should attempt resume (``resume_after``), and whether the VM carries an idle
     dead-man's-switch watchdog (``watchdog_active``). Pausing is only safe when ``watchdog_active``
     is ``True`` — otherwise a missed resume would leave the box billing (the banned fire-and-forget
-    pattern, ``LESSONS.md`` Lesson 9). ``current_owner`` is cleared because no one is driving the
+    pattern, ``LESSONS.md`` Lesson 8). ``current_owner`` is cleared because no one is driving the
     step while paused; ``verify_step_liveness`` treats ``paused_waiting`` as a non-ghost state.
     """
 
     assert watchdog_active, (
         "pause_step requires an active idle watchdog on the VM; pausing without one is the banned "
-        "fire-and-forget pattern (LESSONS Lesson 9)."
+        "fire-and-forget pattern (LESSONS Lesson 8)."
     )
     location: StepLocation = _locate(task_id=task_id, step_number=step_number)
 
@@ -302,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.watchdog_active:
             parser.error(
                 "pause requires --watchdog-active: pausing a step without an active VM "
-                "watchdog is the banned fire-and-forget pattern (LESSONS Lesson 9)."
+                "watchdog is the banned fire-and-forget pattern (LESSONS Lesson 8)."
             )
         pause_step(
             task_id=args.task_id,

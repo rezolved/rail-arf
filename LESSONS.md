@@ -1,6 +1,6 @@
 # Rezolve ARF Lessons
 
-**Version**: 1
+**Version**: 2
 
 A curated index of generalizable lessons accumulated from Rezolve research projects that have been
 run on this framework. Each lesson lists: *what went wrong*, *why*, and *how the framework now
@@ -23,8 +23,8 @@ Latency for prompt N=1 is materially different from N=50 on the same engine sess
 
 **Mitigation in the framework**:
 
-* `arf/scripts/protocols/warmup_runner/` ships the protocol shape: 50 discarded warmup requests
-  then N=20 measured requests, on the same engine session.
+* `arf/scripts/protocols/warmup_runner/` ships the protocol shape: 50 discarded warmup requests then
+  N=20 measured requests, on the same engine session.
 * `meta/asset_types/latency_benchmark_run/specification.md` requires every benchmark asset's
   `details.json` to declare `warmup_requests` and `warmup_corpus_ref`.
 * `verify_latency_benchmark_run_warmup` warns whenever either field is missing or
@@ -48,8 +48,8 @@ post-mortem.
 * `arf/skills/setup-remote-machine/SKILL.md` Phase 4 step 4 ("Engine smoke gate") is **mandatory**
   for any measurement task. One `/health` (or `/version`) call and one minimum-length completion
   must succeed before warmup begins.
-* On smoke-gate failure: mark the condition `null`, skip warmup and measurement, proceed directly
-  to teardown.
+* On smoke-gate failure: mark the condition `null`, skip warmup and measurement, proceed directly to
+  teardown.
 * `machine_log.json` records `smoke_gate_status` (`pass`/`fail`) and the failure reason.
 
 * * *
@@ -82,8 +82,8 @@ container-image drift between dev and prod (vLLM 0.15.0 + CUDA 12.1 + cuDNN 8 vs
 12.8 + cuDNN 9). The audit took weeks because version tags were not captured at the time of the
 benchmark.
 
-**Why**: infrastructure (engine version, CUDA, cuDNN, container SHA) changes between benchmark
-runs. Without capture-at-time-of-measurement, post-hoc comparison is forensics, not science.
+**Why**: infrastructure (engine version, CUDA, cuDNN, container SHA) changes between benchmark runs.
+Without capture-at-time-of-measurement, post-hoc comparison is forensics, not science.
 
 **Mitigation in the framework**:
 
@@ -119,15 +119,15 @@ slightly different confidence intervals, and reviewers cannot reproduce reported
 baseline config, add one flag, run paired sweep" worked great until someone modified the baseline
 asset. All downstream ablations then silently computed wrong deltas against a moving target.
 
-**Why**: ARF's task-isolation rules prevent edits to *other* task folders, but they do not prevent
-a later task from registering a new asset under the same name in its own folder. Aggregators apply
-the corrections overlay but downstream tasks may pin the wrong version.
+**Why**: ARF's task-isolation rules prevent edits to *other* task folders, but they do not prevent a
+later task from registering a new asset under the same name in its own folder. Aggregators apply the
+corrections overlay but downstream tasks may pin the wrong version.
 
 **Mitigation in the framework**:
 
-* Baseline configs (e.g., `vllm_config`, `model_config`) used by multiple downstream tasks should
-  be named with a `_FROZEN` suffix and a version (`_v1`, `_v2`). Downstream ablations reference
-  the baseline by ID **and** a git-commit SHA at which the baseline was last validated.
+* Baseline configs (e.g., `vllm_config`, `model_config`) used by multiple downstream tasks should be
+  named with a `_FROZEN` suffix and a version (`_v1`, `_v2`). Downstream ablations reference the
+  baseline by ID **and** a git-commit SHA at which the baseline was last validated.
 * If a baseline needs revision, register a new `_v2` asset rather than mutating `_v1`.
 
 * * *
@@ -145,9 +145,44 @@ checkpoint × engine compatibility — it fails at runtime, after VM provisionin
 **Mitigation in the framework**:
 
 * Any task plan that includes quantization must list a `## Checkpoint Validation` step that runs
-  **before** VM provisioning. The step downloads `config.json` and inspects safetensors shard
-  keys for the expected quantization-specific tensors. Document the validated HuggingFace
-  model IDs and commit SHAs in the plan.
+  **before** VM provisioning. The step downloads `config.json` and inspects safetensors shard keys
+  for the expected quantization-specific tensors. Document the validated HuggingFace model IDs and
+  commit SHAs in the plan.
+
+* * *
+
+## Lesson 8: Orchestrator must own step liveness — fire-and-forget handoffs cause idle billing
+
+**What went wrong** (rail-arf-serving, GPU benchmark task): a subagent driving an `implementation`
+step finished its setup work, spawned a background poller watching for an engine-ready sentinel on
+the GPU VM, and returned control with a scheduled wakeup registered. Neither the wakeup nor the
+poller actually drove the benchmark when the engine became ready. The VM kept billing for ~9 hours
+before a human caught it, costing ~$130 of unbudgeted spend.
+
+**Why**: ARF had no notion of "who is currently driving this step". `step_tracker.json` recorded
+`status: "in_progress"` but nothing tracked an owner or a heartbeat, so a subagent could legally
+exit while leaving work in a background poller. There was no verificator to flag the absence of
+forward progress and no orchestrator-side liveness scan to detect the gap before re-delegating. The
+failure compounds because the wakeup mechanism is itself fragile: a re-delegated subagent that hits
+a usage cap or simply does not fire leaves the parent task silently stalled with the VM still
+running.
+
+**Mitigation in the framework**:
+
+* Step-tracker v2 liveness fields (`current_owner`, `last_heartbeat_at`,
+  `heartbeat_interval_seconds`, `expected_completion_at`) are required on every `in_progress` step —
+  see `arf/specifications/step_tracker_specification.md`.
+* `arf/scripts/utils/heartbeat.py` (`start_step`, `write_heartbeat`, `pause_step`, `complete_step`)
+  is the single canonical way for a step owner to maintain liveness.
+* `arf/scripts/verificators/verify_step_liveness.py` flags stale heartbeats (`ST-E007` when a live
+  VM is still billing, `ST-W005`/`ST-W006` otherwise) and unsafe pauses (`ST-E008`).
+* `arf/skills/execute-task/SKILL.md` Phase −1 runs `verify_step_liveness --all` at the start of
+  every wakeup; `arf/skills/implementation/SKILL.md` forbids fire-and-forget background pollers.
+* For long external waits, a step may only `pause_waiting` when the VM carries the idle
+  dead-man's-switch watchdog (`arf/scripts/utils/idle_watchdog.sh` +
+  `arf/scripts/utils/watchdog_provisioning.py`) — the watchdog, not the orchestrator, is what
+  guarantees a missed wakeup cannot leave the box billing. The `/diagnose-stuck-step` skill produces
+  a structured recovery report for any flagged step.
 
 * * *
 
@@ -156,8 +191,8 @@ checkpoint × engine compatibility — it fails at runtime, after VM provisionin
 When a Rezolve research project produces a generalizable lesson:
 
 1. Add a new `## Lesson N: <one-line headline>` section to this file.
-2. Use the four-part structure: *What went wrong* (with task/project reference), *Why*,
-   *Mitigation in the framework*.
-3. Implement the mitigation as a default in the relevant skill, asset spec, or verificator. A
-   lesson without a corresponding default is just a complaint.
+2. Use the four-part structure: *What went wrong* (with task/project reference), *Why*, *Mitigation
+   in the framework*.
+3. Implement the mitigation as a default in the relevant skill, asset spec, or verificator. A lesson
+   without a corresponding default is just a complaint.
 4. Increment the file's `**Version**` line at the top.

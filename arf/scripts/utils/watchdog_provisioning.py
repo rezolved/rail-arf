@@ -12,7 +12,7 @@ the self-terminate command and the way credentials reach the VM differ:
   service, so no static secret is written to disk.
 
 These renderers are pure string construction so they can be unit-tested without
-provisioning anything. See ``LESSONS.md`` Lesson 9 for why the VM must be able to
+provisioning anything. See ``LESSONS.md`` Lesson 8 for why the VM must be able to
 stop billing itself without depending on the orchestrator.
 """
 

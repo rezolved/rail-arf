@@ -197,7 +197,7 @@ def _build_message(
         return (
             f"Task {task_id} step {step_number}: status is 'paused_waiting' but "
             f"watchdog_active is not true — pausing a step without an active VM idle "
-            f"watchdog is unsafe (a missed resume burns idle billing, LESSONS Lesson 9). "
+            f"watchdog is unsafe (a missed resume burns idle billing, LESSONS Lesson 8). "
             f"Drive the step synchronously instead, or confirm the watchdog is installed."
         )
     if code == CODE_ST_E007:

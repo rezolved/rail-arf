@@ -121,7 +121,7 @@ returns. A later `execute-task` wakeup re-reads the tracker, and once `now >= re
 re-dispatches the step's skill to re-check the sentinel and either complete or re-pause.
 
 Pausing is safe **only** when the VM carries an idle dead-man's-switch watchdog — otherwise a missed
-resume leaves the box billing, which is the banned fire-and-forget pattern (`LESSONS.md` Lesson 9).
+resume leaves the box billing, which is the banned fire-and-forget pattern (`LESSONS.md` Lesson 8).
 `verify_step_liveness` enforces this: a `paused_waiting` step with `watchdog_active != true` is
 flagged `ST-E008` (error). A `paused_waiting` step with `watchdog_active == true` is a deliberate,
 safe wait and is never treated as ghosted, regardless of heartbeat age.

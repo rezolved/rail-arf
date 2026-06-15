@@ -37,7 +37,7 @@ Read before starting:
   the VM and its SSH coordinates).
 * `arf/scripts/utils/ssh_health_probe.py` — the shared health-probe primitive used here and by
   `setup-remote-machine` Phase 4 (Lesson 2 smoke gate).
-* `LESSONS.md` Lesson 9 (or its successor) — the incident that motivated this skill.
+* `LESSONS.md` Lesson 8 (or its successor) — the incident that motivated this skill.
 * `tasks/$TASK_ID/step_tracker.json` — to read the flagged step's liveness fields.
 * The relevant step log folder under `tasks/$TASK_ID/logs/steps/` — its name is derived from
   `step_tracker.json` `log_file` (when set) or by glob:

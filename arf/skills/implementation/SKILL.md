@@ -87,7 +87,7 @@ Read before starting:
 
    A blind background poller that leaves the step `in_progress` with no watchdog is still forbidden
    — that is the fire-and-forget pattern that produced the 9-hour idle billing incident in
-   `LESSONS.md` Lesson 9. The orchestrator scans liveness on every wakeup via
+   `LESSONS.md` Lesson 8. The orchestrator scans liveness on every wakeup via
    `verify_step_liveness`; ghosted in-progress steps are flagged ST-E007 / ST-W005 / ST-W006, and
    unprotected pauses ST-E008.
 

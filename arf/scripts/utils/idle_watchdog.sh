@@ -8,7 +8,7 @@
 # activity above the threshold resets the idle timer to zero.
 #
 # This protects against the "nobody is driving the step" failure mode
-# (rail-arf-serving LESSONS Lesson 9 / 9.2): the orchestrator's wakeup is
+# (rail-arf-serving LESSONS Lesson 8): the orchestrator's wakeup is
 # fragile, so the VM must be able to stop billing itself without depending on
 # Claude. A running benchmark keeps the GPU busy, so it never trips the timer;
 # only a genuinely stranded VM is terminated.
