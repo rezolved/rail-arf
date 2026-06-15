@@ -5,17 +5,15 @@ exist with timing + cost) as a check that runs on the task branch.
 
 Emits error `MCH-E101` if `logs/steps/*setup-machines*/machine_log.json` is
 missing on a task whose `plan/plan.md` references a compute provider
-(`azure_ml`, `vast_ai`) — see Section 5 (Remote Machines).
+(`azure_ml`, `vast_ai`, `nebius`) — see Section 5 (Remote Machines).
 
-Required fields in `machine_log.json`:
+`machine_log.json` is a JSON array of per-machine entries (one entry per
+provisioned machine). Each entry must carry the cost-attribution fields:
 * `provider`
-* `machine_id`
-* `machine_type`
-* `region`
-* `hourly_rate_usd`
-* `provisioning_start_utc`
-* `teardown_end_utc`
-* `total_uptime_hours`
+* `instance_id`
+* `created_at`
+* `destroyed_at`
+* `total_duration_hours`
 * `total_cost_usd`
 
 Usage:
@@ -38,13 +36,10 @@ SETUP_MACHINES_SUBSTRING: str = "setup-machines"
 
 REQUIRED_FIELDS: list[str] = [
     "provider",
-    "machine_id",
-    "machine_type",
-    "region",
-    "hourly_rate_usd",
-    "provisioning_start_utc",
-    "teardown_end_utc",
-    "total_uptime_hours",
+    "instance_id",
+    "created_at",
+    "destroyed_at",
+    "total_duration_hours",
     "total_cost_usd",
 ]
 
@@ -54,6 +49,7 @@ COMPUTE_PROVIDER_KEYWORDS: list[str] = [
     "vast_ai",
     "vast-ai",
     "vastai",
+    "nebius",
 ]
 
 ERROR_CODE_MISSING_LOG: str = "MCH-E101"
@@ -92,6 +88,49 @@ def _find_machine_log_files(*, steps_dir: Path) -> list[Path]:
     return matches
 
 
+def _check_machine_log_entry(
+    *,
+    log_path: Path,
+    entry: object,
+    index: int,
+) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    if not isinstance(entry, dict):
+        diagnostics.append(
+            Diagnostic(
+                severity="error",
+                code=ERROR_CODE_UNREADABLE,
+                file_path=log_path,
+                message=f"machine_log.json entry {index} is not a JSON object",
+            )
+        )
+        return diagnostics
+    for field in REQUIRED_FIELDS:
+        if field not in entry:
+            diagnostics.append(
+                Diagnostic(
+                    severity="error",
+                    code=ERROR_CODE_MISSING_FIELD,
+                    file_path=log_path,
+                    message=f"entry {index}: required field {field!r} is missing",
+                )
+            )
+        elif entry[field] is None:
+            severity: str = "warning" if field == "total_cost_usd" else "error"
+            code: str = (
+                WARNING_CODE_NULL_COST if field == "total_cost_usd" else ERROR_CODE_MISSING_FIELD
+            )
+            diagnostics.append(
+                Diagnostic(
+                    severity=severity,
+                    code=code,
+                    file_path=log_path,
+                    message=f"entry {index}: field {field!r} is null",
+                )
+            )
+    return diagnostics
+
+
 def _check_machine_log_fields(*, log_path: Path) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     try:
@@ -107,39 +146,22 @@ def _check_machine_log_fields(*, log_path: Path) -> list[Diagnostic]:
             )
         )
         return diagnostics
-    if not isinstance(data, dict):
+    if not isinstance(data, list):
         diagnostics.append(
             Diagnostic(
                 severity="error",
                 code=ERROR_CODE_UNREADABLE,
                 file_path=log_path,
-                message="machine_log.json top-level value is not a JSON object",
+                message="machine_log.json top-level value is not a JSON array",
             )
         )
         return diagnostics
-    for field in REQUIRED_FIELDS:
-        if field not in data:
-            diagnostics.append(
-                Diagnostic(
-                    severity="error",
-                    code=ERROR_CODE_MISSING_FIELD,
-                    file_path=log_path,
-                    message=f"required field {field!r} is missing",
-                )
-            )
-        elif data[field] is None:
-            severity: str = "warning" if field == "total_cost_usd" else "error"
-            code: str = (
-                WARNING_CODE_NULL_COST if field == "total_cost_usd" else ERROR_CODE_MISSING_FIELD
-            )
-            diagnostics.append(
-                Diagnostic(
-                    severity=severity,
-                    code=code,
-                    file_path=log_path,
-                    message=f"field {field!r} is null",
-                )
-            )
+    # A present-but-empty array records a setup-machines step that acquired no
+    # machine (e.g. a blocked attempt before a fallback). There is no cost to
+    # attribute, so it is acceptable; only a *missing* log on a compute task is
+    # an error (MCH-E101, handled in verify_task).
+    for index, entry in enumerate(data):
+        diagnostics.extend(_check_machine_log_entry(log_path=log_path, entry=entry, index=index))
     return diagnostics
 
 
