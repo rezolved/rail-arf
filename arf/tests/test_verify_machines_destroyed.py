@@ -68,6 +68,49 @@ def _setup(*, monkeypatch: pytest.MonkeyPatch, repo_root: Path) -> None:
         "_check_instance_via_api",
         lambda *, instance_id: None,
     )
+    # Stub out Azure ML API calls
+    monkeypatch.setattr(
+        verify_rm_module,
+        "_check_azure_vm_state",
+        lambda *, vm_name: None,
+    )
+
+
+AZURE_VM_NAME: str = "arf-NC80-weu-v1"
+
+
+def _full_azure_machine_log_entry(
+    **overrides: object,
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "spec_version": "5",
+        "provider": "azure_ml",
+        "instance_id": AZURE_VM_NAME,
+        "vm_name": AZURE_VM_NAME,
+        "offer_id": "azure-h100-pool",
+        "search_criteria": {"gpu_name": "H100"},
+        "selected_offer": {"offer_id": "azure-h100-pool", "gpu": "H100"},
+        "selection_rationale": "Azure ML H100 pool slot acquired for benchmarking.",
+        "image": "azureml://curated/vllm:0.20.2",
+        "disk_gb": 200,
+        "ssh_host": "10.0.0.1",
+        "ssh_port": 22,
+        "gpu_verified": True,
+        "cuda_version": "12.9",
+        "created_at": "2026-05-20T00:00:00Z",
+        "ready_at": "2026-05-20T00:10:00Z",
+        "destroyed_at": "2026-05-20T02:00:00Z",
+        "total_duration_hours": 2.0,
+        "total_cost_usd": 27.92,
+        "label": "my-project/t0001_test",
+        "search_started_at": "2026-05-20T00:00:00Z",
+        "total_provisioning_seconds": 600.0,
+        "failed_attempts": [],
+        "checkpoint_path": None,
+        "heartbeat_path": None,
+    }
+    entry.update(overrides)
+    return entry
 
 
 def _codes(result: VerificationResult) -> list[str]:
@@ -903,6 +946,502 @@ def test_rm_w006_not_emitted_when_checkpoint_set(
 # ---------------------------------------------------------------------------
 # v2 fields accepted without errors
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Azure ML branch tests
+# ---------------------------------------------------------------------------
+
+
+def test_azure_destroyed_passes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    monkeypatch.setattr(
+        verify_rm_module,
+        "_check_azure_vm_state",
+        lambda *, vm_name: "Deallocated",
+    )
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "azure_ml",
+                "machine_id": AZURE_VM_NAME,
+                "gpu": "H100",
+                "gpu_count": 2,
+                "ram_gb": 880,
+                "duration_hours": 2.0,
+                "cost_usd": 27.92,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[_full_azure_machine_log_entry()],
+    )
+    result: VerificationResult = _verify()
+    assert "RM-E001" not in _codes(result=result)
+    assert "RM-E002" not in _codes(result=result)
+
+
+def test_azure_no_destroyed_at_emits_rm_e001(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "azure_ml",
+                "machine_id": AZURE_VM_NAME,
+                "gpu": "H100",
+                "gpu_count": 2,
+                "ram_gb": 880,
+                "duration_hours": 2.0,
+                "cost_usd": 27.92,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[
+            _full_azure_machine_log_entry(destroyed_at=None),
+        ],
+    )
+    result: VerificationResult = _verify()
+    assert "RM-E001" in _codes(result=result)
+
+
+def test_azure_state_running_emits_rm_e002(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    monkeypatch.setattr(
+        verify_rm_module,
+        "_check_azure_vm_state",
+        lambda *, vm_name: "Running",
+    )
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "azure_ml",
+                "machine_id": AZURE_VM_NAME,
+                "gpu": "H100",
+                "gpu_count": 2,
+                "ram_gb": 880,
+                "duration_hours": 2.0,
+                "cost_usd": 27.92,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[_full_azure_machine_log_entry()],
+    )
+    result: VerificationResult = _verify()
+    assert "RM-E002" in _codes(result=result)
+
+
+def test_azure_api_unreachable_emits_rm_w001(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    # _check_azure_vm_state default stub returns None (API unreachable).
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "azure_ml",
+                "machine_id": AZURE_VM_NAME,
+                "gpu": "H100",
+                "gpu_count": 2,
+                "ram_gb": 880,
+                "duration_hours": 2.0,
+                "cost_usd": 27.92,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[_full_azure_machine_log_entry()],
+    )
+    result: VerificationResult = _verify()
+    codes: list[str] = _codes(result=result)
+    assert "RM-W001" in codes
+    # destroyed_at is authoritative when API is unreachable; no RM-E002.
+    assert "RM-E002" not in codes
+
+
+# ---------------------------------------------------------------------------
+# RM-E007: unknown provider value
+# ---------------------------------------------------------------------------
+
+
+def test_rm_e007_unknown_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "lambda_labs",
+                "machine_id": INSTANCE_ID,
+                "gpu": "H100",
+                "gpu_count": 1,
+                "ram_gb": 880,
+                "duration_hours": 2.0,
+                "cost_usd": 27.92,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[
+            _full_machine_log_entry(provider="lambda_labs"),
+        ],
+    )
+    result: VerificationResult = _verify()
+    assert "RM-E007" in _codes(result=result)
+
+
+# ---------------------------------------------------------------------------
+# RM-W007: spec_version missing or not "5"
+# ---------------------------------------------------------------------------
+
+
+def test_rm_w007_spec_version_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "vast.ai",
+                "machine_id": INSTANCE_ID,
+                "gpu": "RTX 2080 Ti",
+                "gpu_count": 1,
+                "ram_gb": 21,
+                "duration_hours": 2.0,
+                "cost_usd": 0.08,
+            },
+        ],
+    )
+    # Legacy entry: no spec_version key.
+    entry: dict[str, object] = _full_machine_log_entry()
+    assert "spec_version" not in entry
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[entry],
+    )
+    result: VerificationResult = _verify()
+    assert "RM-W007" in _codes(result=result)
+
+
+def test_rm_w007_not_emitted_for_current_spec_version(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    monkeypatch.setattr(
+        verify_rm_module,
+        "_check_azure_vm_state",
+        lambda *, vm_name: "Deallocated",
+    )
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "azure_ml",
+                "machine_id": AZURE_VM_NAME,
+                "gpu": "H100",
+                "gpu_count": 2,
+                "ram_gb": 880,
+                "duration_hours": 2.0,
+                "cost_usd": 27.92,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[_full_azure_machine_log_entry()],
+    )
+    result: VerificationResult = _verify()
+    assert "RM-W007" not in _codes(result=result)
+
+
+# ---------------------------------------------------------------------------
+# New provider slug "vast_ai" accepted alongside legacy "vast.ai"
+# ---------------------------------------------------------------------------
+
+
+def test_new_vast_ai_slug_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "vast_ai",
+                "machine_id": INSTANCE_ID,
+                "gpu": "RTX 2080 Ti",
+                "gpu_count": 1,
+                "ram_gb": 21,
+                "duration_hours": 2.0,
+                "cost_usd": 0.08,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[
+            _full_machine_log_entry(spec_version="5", provider="vast_ai"),
+        ],
+    )
+    result: VerificationResult = _verify()
+    codes: list[str] = _codes(result=result)
+    assert "RM-E007" not in codes
+    assert "RM-W007" not in codes
+
+
+NEBIUS_INSTANCE_ID: str = "computeinstance-test-001"
+
+
+def _full_nebius_machine_log_entry(
+    **overrides: object,
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "spec_version": "5",
+        "provider": "nebius",
+        "instance_id": NEBIUS_INSTANCE_ID,
+        "platform": "gpu-h200-sxm",
+        "preset": "1gpu-16vcpu-200gb",
+        "image_id": "computeimage-test",
+        "region": "eu-north1",
+        "tenant_id": "tenant-test",
+        "project_id": "project-test",
+        "public_ip": "10.0.0.1",
+        "boot_disk_id": "computedisk-test",
+        "offer_id": "nebius-gpu-h200-sxm",
+        "search_criteria": {"gpu_name": "H200"},
+        "selected_offer": {
+            "offer_id": "nebius-gpu-h200-sxm",
+            "platform": "gpu-h200-sxm",
+            "preset": "1gpu-16vcpu-200gb",
+            "gpu": "H200",
+            "gpu_count": 1,
+            "gpu_ram_gb": 141.0,
+            "cpu_ram_gb": 200.0,
+            "disk_gb": 100.0,
+            "region": "eu-north1",
+            "hourly_cost_estimate_usd": None,
+        },
+        "selection_rationale": "Nebius H200 preset acquired for benchmarking.",
+        "image": "computeimage-test",
+        "disk_gb": 100,
+        "ssh_host": "10.0.0.1",
+        "ssh_port": 22,
+        "gpu_verified": True,
+        "cuda_version": "13.0",
+        "created_at": "2026-06-01T00:00:00Z",
+        "ready_at": "2026-06-01T00:05:00Z",
+        "destroyed_at": "2026-06-01T01:00:00Z",
+        "total_duration_hours": 1.0,
+        "total_cost_usd": 3.50,
+        "label": "my-project/t0001_test",
+        "search_started_at": "2026-06-01T00:00:00Z",
+        "total_provisioning_seconds": 300.0,
+        "failed_attempts": [],
+        "checkpoint_path": None,
+        "heartbeat_path": None,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _setup_nebius(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    repo_root: Path,
+    state: str | None = None,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=repo_root)
+    monkeypatch.setattr(
+        verify_rm_module,
+        "_check_nebius_instance_state",
+        lambda *, instance_id: state,
+    )
+
+
+def test_check_machine_nebius_destroyed_ok(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup_nebius(monkeypatch=monkeypatch, repo_root=tmp_path, state=None)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "nebius",
+                "machine_id": NEBIUS_INSTANCE_ID,
+                "gpu": "H200",
+                "gpu_count": 1,
+                "ram_gb": 200,
+                "duration_hours": 1.0,
+                "cost_usd": 3.50,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[_full_nebius_machine_log_entry()],
+    )
+    result: VerificationResult = _verify()
+    codes: list[str] = _codes(result=result)
+    assert "RM-W001" in codes
+    assert len(result.errors) == 0
+
+
+def test_check_machine_nebius_destroyed_at_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup_nebius(monkeypatch=monkeypatch, repo_root=tmp_path, state=None)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "nebius",
+                "machine_id": NEBIUS_INSTANCE_ID,
+                "gpu": "H200",
+                "gpu_count": 1,
+                "ram_gb": 200,
+                "duration_hours": 1.0,
+                "cost_usd": 3.50,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[_full_nebius_machine_log_entry(destroyed_at=None)],
+    )
+    result: VerificationResult = _verify()
+    assert "RM-E001" in _codes(result=result)
+
+
+def test_check_machine_nebius_destroyed_at_missing_and_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup_nebius(monkeypatch=monkeypatch, repo_root=tmp_path, state="RUNNING")
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "nebius",
+                "machine_id": NEBIUS_INSTANCE_ID,
+                "gpu": "H200",
+                "gpu_count": 1,
+                "ram_gb": 200,
+                "duration_hours": 1.0,
+                "cost_usd": 3.50,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[_full_nebius_machine_log_entry(destroyed_at=None)],
+    )
+    result: VerificationResult = _verify()
+    codes: list[str] = _codes(result=result)
+    assert "RM-E001" in codes
+    assert "RM-E002" in codes
+
+
+def test_check_machine_nebius_destroyed_at_present_but_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup_nebius(monkeypatch=monkeypatch, repo_root=tmp_path, state="RUNNING")
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID)
+    build_remote_machines_file(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        payload=[
+            {
+                "provider": "nebius",
+                "machine_id": NEBIUS_INSTANCE_ID,
+                "gpu": "H200",
+                "gpu_count": 1,
+                "ram_gb": 200,
+                "duration_hours": 1.0,
+                "cost_usd": 3.50,
+            },
+        ],
+    )
+    _build_machine_log(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        entries=[_full_nebius_machine_log_entry()],
+    )
+    result: VerificationResult = _verify()
+    assert "RM-E002" in _codes(result=result)
 
 
 def test_v2_fields_accepted_without_errors(

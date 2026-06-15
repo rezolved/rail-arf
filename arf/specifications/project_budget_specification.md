@@ -77,7 +77,8 @@ The file must be a single JSON object with these fields:
   "available_services": [
     "openai_api",
     "anthropic_api",
-    "vast_ai"
+    "vast_ai",
+    "nebius_cloud"
   ],
   "alerts": {
     "warn_at_percent": 80,

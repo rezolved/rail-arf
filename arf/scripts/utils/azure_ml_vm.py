@@ -110,9 +110,10 @@ class VmPoolEntry:
     notes: str
 
 
-def load_pool(*, config_path: Path = POOL_CONFIG_PATH) -> list[VmPoolEntry]:
+def load_pool(*, config_path: Path | None = None) -> list[VmPoolEntry]:
+    resolved: Path = config_path if config_path is not None else POOL_CONFIG_PATH
     pool_file: VmPoolFile = VmPoolFile.model_validate_json(
-        config_path.read_text(encoding="utf-8"),
+        resolved.read_text(encoding="utf-8"),
     )
     entries: list[VmPoolEntry] = [
         VmPoolEntry(

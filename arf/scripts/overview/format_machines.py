@@ -71,6 +71,26 @@ def _format_gpu_tier_costs(*, gpu_tier_costs: dict[str, float]) -> list[str]:
     return lines
 
 
+def _format_provider_breakdown(*, summary: MachineSummary) -> list[str]:
+    if len(summary.provider_machine_counts) == 0:
+        return []
+
+    sorted_providers: list[str] = sorted(summary.provider_machine_counts.keys())
+    lines: list[str] = [
+        "## Provider Breakdown",
+        "",
+        "| Provider | Machines | Cost (USD) | Failure Rate |",
+        "|----------|----------|------------|--------------|",
+    ]
+    for provider in sorted_providers:
+        machines: int = summary.provider_machine_counts.get(provider, 0)
+        cost: float = summary.provider_costs.get(provider, 0.0)
+        failure_rate: float = summary.provider_failure_rates.get(provider, 0.0)
+        lines.append(f"| {provider} | {machines} | ${cost:.2f} | {failure_rate:.1%} |")
+    lines.append("")
+    return lines
+
+
 def _format_failure_reasons(*, failure_reasons: dict[str, int]) -> list[str]:
     if len(failure_reasons) == 0:
         return []
@@ -138,6 +158,7 @@ def _format_overview(*, aggregation: MachineAggregation) -> str:
     lines.extend(
         _format_gpu_tier_costs(gpu_tier_costs=summary.gpu_tier_costs),
     )
+    lines.extend(_format_provider_breakdown(summary=summary))
     lines.extend(
         _format_failure_reasons(
             failure_reasons=summary.failure_reasons,

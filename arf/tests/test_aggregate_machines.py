@@ -492,3 +492,272 @@ def test_wasted_cost_summed(
     result = _aggregate()
 
     assert result.summary.total_wasted_cost_usd == pytest.approx(0.17)
+
+
+# ---------------------------------------------------------------------------
+# test_provider_breakdown_multi_provider
+# ---------------------------------------------------------------------------
+
+
+def _azure_machine_log_entry(**overrides: object) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "spec_version": "5",
+        "provider": "azure_ml",
+        "instance_id": "arf-NC80-weu-v1",
+        "vm_name": "arf-NC80-weu-v1",
+        "offer_id": "azure-h100-pool",
+        "search_criteria": {"gpu_name": "H100"},
+        "selected_offer": {
+            "offer_id": "azure-h100-pool",
+            "gpu": "H100",
+            "gpu_count": 2,
+            "gpu_ram_gb": 80.0,
+            "cpu_ram_gb": 880.0,
+            "disk_gb": 1024.0,
+            "price_per_hour": 13.96,
+            "reliability": 1.0,
+            "location": "westeurope",
+        },
+        "selection_rationale": "Azure ML H100 pool slot acquired for benchmarking.",
+        "image": "azureml://curated/vllm:0.20.2",
+        "disk_gb": 200,
+        "label": "my-project/t0002_test",
+        "ssh_host": "10.0.0.1",
+        "ssh_port": 22,
+        "gpu_verified": True,
+        "cuda_version": "12.9",
+        "created_at": "2026-05-20T00:00:00Z",
+        "ready_at": "2026-05-20T00:10:00Z",
+        "destroyed_at": "2026-05-20T02:00:00Z",
+        "total_duration_hours": 2.0,
+        "total_cost_usd": 27.92,
+        "search_started_at": "2026-05-20T00:00:00Z",
+        "total_provisioning_seconds": 600.0,
+        "failed_attempts": [],
+        "checkpoint_path": None,
+        "heartbeat_path": None,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_provider_breakdown_multi_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Mixed Vast.ai + Azure ML logs produce per-provider breakdown."""
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID_1)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID_1)
+    vast_failed: list[dict[str, object]] = [
+        {
+            "offer_id": 11111111,
+            "gpu": "RTX 3090",
+            "failure_reason": "SSH timeout",
+            "wasted_cost_usd": 0.02,
+        },
+    ]
+    _build_machine_log(
+        task_id=TASK_ID_1,
+        entries=[
+            _full_machine_log_entry(
+                total_cost_usd=0.30,
+                failed_attempts=vast_failed,
+            ),
+        ],
+    )
+
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID_2)
+    build_task_json(
+        repo_root=tmp_path,
+        task_id=TASK_ID_2,
+        task_index=2,
+    )
+    _build_machine_log(
+        task_id=TASK_ID_2,
+        entries=[
+            _azure_machine_log_entry(total_cost_usd=27.92),
+            _azure_machine_log_entry(
+                instance_id="arf-NC80-neu-v1",
+                vm_name="arf-NC80-neu-v1",
+                total_cost_usd=14.00,
+            ),
+        ],
+    )
+
+    result = _aggregate()
+
+    assert result.summary.provider_machine_counts == {
+        "vast_ai": 1,
+        "azure_ml": 2,
+    }
+    assert result.summary.provider_costs["vast_ai"] == pytest.approx(0.30)
+    assert result.summary.provider_costs["azure_ml"] == pytest.approx(41.92)
+    # vast: 1 success + 1 failure = 0.5; azure: 2 success + 0 failure = 0.0
+    assert result.summary.provider_failure_rates["vast_ai"] == pytest.approx(0.5)
+    assert result.summary.provider_failure_rates["azure_ml"] == pytest.approx(0.0)
+
+
+def test_legacy_provider_spellings_normalised(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Both ``vast.ai`` and ``azure-ml`` normalise to canonical slugs."""
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID_1)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID_1)
+    _build_machine_log(
+        task_id=TASK_ID_1,
+        entries=[
+            _full_machine_log_entry(provider="vast.ai"),
+            _azure_machine_log_entry(provider="azure-ml"),
+        ],
+    )
+    result = _aggregate()
+    assert result.summary.provider_machine_counts.get("vast_ai") == 1
+    assert result.summary.provider_machine_counts.get("azure_ml") == 1
+
+
+def test_unknown_provider_bucketed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID_1)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID_1)
+    _build_machine_log(
+        task_id=TASK_ID_1,
+        entries=[
+            _full_machine_log_entry(provider="lambda_labs"),
+        ],
+    )
+    result = _aggregate()
+    assert result.summary.provider_machine_counts.get("unknown") == 1
+
+
+def _nebius_machine_log_entry(**overrides: object) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "spec_version": "5",
+        "provider": "nebius",
+        "instance_id": "computeinstance-test-001",
+        "platform": "gpu-h200-sxm",
+        "preset": "1gpu-16vcpu-200gb",
+        "image_id": "computeimage-test",
+        "region": "eu-north1",
+        "tenant_id": "tenant-test",
+        "project_id": "project-test",
+        "public_ip": "10.0.0.1",
+        "boot_disk_id": "computedisk-test",
+        "offer_id": "nebius-gpu-h200-sxm",
+        "search_criteria": {"gpu_name": "H200"},
+        "selected_offer": {
+            "offer_id": "nebius-gpu-h200-sxm",
+            "platform": "gpu-h200-sxm",
+            "preset": "1gpu-16vcpu-200gb",
+            "gpu": "H200",
+            "gpu_count": 1,
+            "gpu_ram_gb": 141.0,
+            "cpu_ram_gb": 200.0,
+            "disk_gb": 100.0,
+            "region": "eu-north1",
+            "hourly_cost_estimate_usd": None,
+        },
+        "selection_rationale": "Nebius H200 preset acquired for benchmarking.",
+        "image": "computeimage-test",
+        "disk_gb": 100,
+        "label": "my-project/t0002_test",
+        "ssh_host": "10.0.0.1",
+        "ssh_port": 22,
+        "gpu_verified": True,
+        "cuda_version": "13.0",
+        "created_at": "2026-06-01T00:00:00Z",
+        "ready_at": "2026-06-01T00:05:00Z",
+        "destroyed_at": "2026-06-01T01:00:00Z",
+        "total_duration_hours": 1.0,
+        "total_cost_usd": 3.50,
+        "search_started_at": "2026-06-01T00:00:00Z",
+        "total_provisioning_seconds": 300.0,
+        "failed_attempts": [],
+        "checkpoint_path": None,
+        "heartbeat_path": None,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_nebius_provider_rollup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """One Nebius machine log entry produces correct provider rollup."""
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID_1)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID_1)
+    _build_machine_log(
+        task_id=TASK_ID_1,
+        entries=[_nebius_machine_log_entry()],
+    )
+
+    result = _aggregate()
+
+    assert result.summary.provider_machine_counts["nebius"] == 1
+    assert result.summary.provider_costs["nebius"] == pytest.approx(3.50)
+
+
+def test_provider_aliases_normalised_to_nebius(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``nebius_cloud`` alias normalises to canonical ``nebius`` slug."""
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID_1)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID_1)
+    _build_machine_log(
+        task_id=TASK_ID_1,
+        entries=[_nebius_machine_log_entry(provider="nebius_cloud")],
+    )
+
+    result = _aggregate()
+
+    assert result.summary.provider_machine_counts.get("nebius") == 1
+
+
+def test_markdown_contains_provider_breakdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from arf.scripts.aggregators import aggregate_machines as agg_module
+
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID_1)
+    build_task_json(repo_root=tmp_path, task_id=TASK_ID_1)
+    build_task_folder(repo_root=tmp_path, task_id=TASK_ID_2)
+    build_task_json(
+        repo_root=tmp_path,
+        task_id=TASK_ID_2,
+        task_index=2,
+    )
+    _build_machine_log(
+        task_id=TASK_ID_1,
+        entries=[_full_machine_log_entry()],
+    )
+    _build_machine_log(
+        task_id=TASK_ID_2,
+        entries=[_azure_machine_log_entry()],
+    )
+
+    aggregation = agg_module.aggregate_machines()
+    md_short: str = agg_module._format_markdown_short(
+        aggregation=aggregation,
+    )
+    md_full: str = agg_module._format_markdown_full(
+        aggregation=aggregation,
+    )
+
+    assert "### Provider Breakdown" in md_short
+    assert "### Provider Breakdown" in md_full
+    assert "vast_ai" in md_short
+    assert "azure_ml" in md_short
+    assert "vast_ai" in md_full
+    assert "azure_ml" in md_full

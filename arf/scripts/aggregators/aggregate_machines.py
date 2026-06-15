@@ -39,6 +39,23 @@ _FIELD_TOTAL_PROVISIONING_SECONDS: str = "total_provisioning_seconds"
 _FIELD_FAILED_ATTEMPTS: str = "failed_attempts"
 _FIELD_FAILURE_REASON: str = "failure_reason"
 _FIELD_WASTED_COST_USD: str = "wasted_cost_usd"
+_FIELD_PROVIDER: str = "provider"
+
+_PROVIDER_VAST_AI: str = "vast_ai"
+_PROVIDER_AZURE_ML: str = "azure_ml"
+_PROVIDER_NEBIUS: str = "nebius"
+_PROVIDER_UNKNOWN: str = "unknown"
+
+# Normalisation map: legacy or alternate spellings -> canonical slug.
+_PROVIDER_ALIASES: dict[str, str] = {
+    "vast_ai": _PROVIDER_VAST_AI,
+    "vast.ai": _PROVIDER_VAST_AI,
+    "azure_ml": _PROVIDER_AZURE_ML,
+    "azure-ml": _PROVIDER_AZURE_ML,
+    "nebius": _PROVIDER_NEBIUS,
+    "nebius_cloud": _PROVIDER_NEBIUS,
+    "nebius-cloud": _PROVIDER_NEBIUS,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +73,9 @@ class MachineSummary:
     total_wasted_cost_usd: float
     gpu_tier_costs: dict[str, float]
     failure_reasons: dict[str, int]
+    provider_machine_counts: dict[str, int] = field(default_factory=dict)
+    provider_costs: dict[str, float] = field(default_factory=dict)
+    provider_failure_rates: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +107,15 @@ class _MachineAccumulator:
     provisioning_seconds_values: list[float] = field(default_factory=list)
     gpu_tier_costs: dict[str, float] = field(default_factory=dict)
     failure_reasons: dict[str, int] = field(default_factory=dict)
+    provider_machine_counts: dict[str, int] = field(default_factory=dict)
+    provider_costs: dict[str, float] = field(default_factory=dict)
+    provider_failed_attempts: dict[str, int] = field(default_factory=dict)
+
+
+def _normalise_provider(*, value: object) -> str:
+    if isinstance(value, str) and value in _PROVIDER_ALIASES:
+        return _PROVIDER_ALIASES[value]
+    return _PROVIDER_UNKNOWN
 
 
 def _is_number(value: object) -> TypeGuard[int | float]:
@@ -140,11 +169,15 @@ def _process_entry(
 ) -> tuple[float, int, str | None]:
     acc.total_machines += 1
 
+    provider: str = _normalise_provider(value=entry.get(_FIELD_PROVIDER))
+    acc.provider_machine_counts[provider] = acc.provider_machine_counts.get(provider, 0) + 1
+
     cost: float = 0.0
     raw_cost: object = entry.get(_FIELD_TOTAL_COST_USD)
     if _is_number(raw_cost):
         cost = float(raw_cost)
         acc.total_cost_usd += cost
+        acc.provider_costs[provider] = acc.provider_costs.get(provider, 0.0) + cost
 
     gpu_model: str | None = _extract_gpu_model(entry=entry)
     if gpu_model is not None:
@@ -162,6 +195,9 @@ def _process_entry(
                 continue
             failed_count += 1
             acc.total_failed_attempts += 1
+            acc.provider_failed_attempts[provider] = (
+                acc.provider_failed_attempts.get(provider, 0) + 1
+            )
 
             reason: object = attempt.get(_FIELD_FAILURE_REASON)
             if isinstance(reason, str) and len(reason) > 0:
@@ -241,6 +277,16 @@ def aggregate_machines() -> MachineAggregation:
     if len(acc.provisioning_seconds_values) > 0:
         avg_prov = sum(acc.provisioning_seconds_values) / len(acc.provisioning_seconds_values)
 
+    provider_failure_rates: dict[str, float] = {}
+    all_provider_keys: set[str] = set(acc.provider_machine_counts.keys()) | set(
+        acc.provider_failed_attempts.keys()
+    )
+    for provider_key in all_provider_keys:
+        successes: int = acc.provider_machine_counts.get(provider_key, 0)
+        failures: int = acc.provider_failed_attempts.get(provider_key, 0)
+        attempts: int = successes + failures
+        provider_failure_rates[provider_key] = failures / attempts if attempts > 0 else 0.0
+
     summary: MachineSummary = MachineSummary(
         total_machines=acc.total_machines,
         total_failed_attempts=acc.total_failed_attempts,
@@ -250,6 +296,9 @@ def aggregate_machines() -> MachineAggregation:
         total_wasted_cost_usd=acc.total_wasted_cost_usd,
         gpu_tier_costs=dict(acc.gpu_tier_costs),
         failure_reasons=dict(acc.failure_reasons),
+        provider_machine_counts=dict(acc.provider_machine_counts),
+        provider_costs=dict(acc.provider_costs),
+        provider_failure_rates=provider_failure_rates,
     )
 
     return MachineAggregation(
@@ -265,6 +314,27 @@ def aggregate_machines() -> MachineAggregation:
 
 def _format_json(*, aggregation: MachineAggregation) -> str:
     return json.dumps(asdict(aggregation), indent=2, ensure_ascii=False)
+
+
+def _provider_breakdown_lines(*, summary: MachineSummary) -> list[str]:
+    if len(summary.provider_machine_counts) == 0:
+        return []
+    lines: list[str] = [
+        "### Provider Breakdown",
+        "",
+        "| Provider | Machines | Cost (USD) | Failure Rate |",
+        "|----------|----------|------------|--------------|",
+    ]
+    providers_sorted: list[str] = sorted(summary.provider_machine_counts.keys())
+    for provider in providers_sorted:
+        machines: int = summary.provider_machine_counts.get(provider, 0)
+        cost: float = summary.provider_costs.get(provider, 0.0)
+        rate: float = summary.provider_failure_rates.get(provider, 0.0)
+        lines.append(
+            f"| {provider} | {machines} | ${cost:.2f} | {rate:.1%} |",
+        )
+    lines.append("")
+    return lines
 
 
 def _format_markdown_short(*, aggregation: MachineAggregation) -> str:
@@ -299,6 +369,8 @@ def _format_markdown_short(*, aggregation: MachineAggregation) -> str:
             "",
         ]
     )
+
+    lines.extend(_provider_breakdown_lines(summary=s))
 
     if len(aggregation.tasks) > 0:
         lines.extend(
@@ -354,6 +426,8 @@ def _format_markdown_full(*, aggregation: MachineAggregation) -> str:
             "",
         ]
     )
+
+    lines.extend(_provider_breakdown_lines(summary=s))
 
     if len(s.gpu_tier_costs) > 0:
         lines.extend(

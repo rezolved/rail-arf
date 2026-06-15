@@ -27,6 +27,7 @@ KNOWN_SERVICE_ALIASES: dict[str, tuple[str, ...]] = {
     "anthropic_api": ("anthropic", "claude"),
     "vast_ai": ("vast-ai", "vastai"),
     "azure_ml": ("azure-ml", "azureml", "azure_ml_compute"),
+    "nebius_cloud": ("nebius", "nebius-cloud", "nebiuscloud"),
 }
 
 
