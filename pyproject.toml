@@ -41,6 +41,8 @@ dependencies = [
     "types-tqdm>=4.67.3.20260303",
     "pymupdf>=1.27.2.2",
     "vastai>=1.0.1",
+    "numpy>=2.0",
+    "scipy>=1.0",
 ]
 
 [project.urls]
@@ -88,6 +90,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8",
     "types-pyyaml",
+    "scipy-stubs",
 ]
 
 [tool.flowmark]

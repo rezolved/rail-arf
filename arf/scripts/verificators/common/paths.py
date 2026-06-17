@@ -9,6 +9,8 @@ DATASET_ASSETS_DIR: Path = ASSETS_DIR / "dataset"
 LIBRARY_ASSETS_DIR: Path = ASSETS_DIR / "library"
 MODEL_ASSETS_DIR: Path = ASSETS_DIR / "model"
 PREDICTIONS_ASSETS_DIR: Path = ASSETS_DIR / "predictions"
+VLLM_CONFIG_ASSETS_DIR: Path = ASSETS_DIR / "vllm_config"
+LATENCY_BENCHMARK_RUN_ASSETS_DIR: Path = ASSETS_DIR / "latency_benchmark_run"
 ASSET_TYPES_DIR: Path = REPO_ROOT / "meta" / "asset_types"
 CATEGORIES_DIR: Path = REPO_ROOT / "meta" / "categories"
 METRICS_DIR: Path = REPO_ROOT / "meta" / "metrics"
@@ -382,3 +384,65 @@ def news_md_path(*, date: str) -> Path:
 
 def news_json_path(*, date: str) -> Path:
     return NEWS_DIR / f"{date}.json"
+
+
+# ---------------------------------------------------------------------------
+# vllm_config asset paths
+# ---------------------------------------------------------------------------
+
+
+def vllm_config_base_dir(*, task_id: str | None) -> Path:
+    if task_id is not None:
+        return TASKS_DIR / task_id / "assets" / "vllm_config"
+    return VLLM_CONFIG_ASSETS_DIR
+
+
+def vllm_config_asset_dir(*, config_id: str, task_id: str | None = None) -> Path:
+    return vllm_config_base_dir(task_id=task_id) / config_id
+
+
+def vllm_config_details_path(*, config_id: str, task_id: str | None = None) -> Path:
+    return vllm_config_asset_dir(config_id=config_id, task_id=task_id) / "details.json"
+
+
+def vllm_config_launch_script_path(*, config_id: str, task_id: str | None = None) -> Path:
+    return vllm_config_asset_dir(config_id=config_id, task_id=task_id) / "launch.sh"
+
+
+def vllm_config_env_path(*, config_id: str, task_id: str | None = None) -> Path:
+    return vllm_config_asset_dir(config_id=config_id, task_id=task_id) / "env.json"
+
+
+def vllm_config_notes_path(*, config_id: str, task_id: str | None = None) -> Path:
+    return vllm_config_asset_dir(config_id=config_id, task_id=task_id) / "notes.md"
+
+
+# ---------------------------------------------------------------------------
+# latency_benchmark_run asset paths
+# ---------------------------------------------------------------------------
+
+
+def latency_benchmark_run_base_dir(*, task_id: str | None) -> Path:
+    if task_id is not None:
+        return TASKS_DIR / task_id / "assets" / "latency_benchmark_run"
+    return LATENCY_BENCHMARK_RUN_ASSETS_DIR
+
+
+def latency_benchmark_run_asset_dir(*, run_id: str, task_id: str | None = None) -> Path:
+    return latency_benchmark_run_base_dir(task_id=task_id) / run_id
+
+
+def latency_benchmark_run_details_path(*, run_id: str, task_id: str | None = None) -> Path:
+    return latency_benchmark_run_asset_dir(run_id=run_id, task_id=task_id) / "details.json"
+
+
+def latency_benchmark_run_summary_path(*, run_id: str, task_id: str | None = None) -> Path:
+    return latency_benchmark_run_asset_dir(run_id=run_id, task_id=task_id) / "summary.json"
+
+
+def latency_benchmark_run_raw_requests_path(
+    *,
+    run_id: str,
+    task_id: str | None = None,
+) -> Path:
+    return latency_benchmark_run_asset_dir(run_id=run_id, task_id=task_id) / "raw_requests.jsonl"

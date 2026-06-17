@@ -26,16 +26,32 @@ class PairedDelta:
     n_resamples: int
 
 
+def _stat_mean(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    return np.asarray(np.mean(x, axis=axis))
+
+
+def _stat_p50(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    return np.asarray(np.percentile(x, 50, axis=axis))
+
+
+def _stat_p95(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    return np.asarray(np.percentile(x, 95, axis=axis))
+
+
+def _stat_p99(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    return np.asarray(np.percentile(x, 99, axis=axis))
+
+
 def _statistic_fn(statistic: Statistic) -> StatFn:
     match statistic:
         case Statistic.MEAN:
-            return lambda x, axis=-1: np.mean(x, axis=axis)
+            return _stat_mean
         case Statistic.P50:
-            return lambda x, axis=-1: np.percentile(x, 50, axis=axis)
+            return _stat_p50
         case Statistic.P95:
-            return lambda x, axis=-1: np.percentile(x, 95, axis=axis)
+            return _stat_p95
         case Statistic.P99:
-            return lambda x, axis=-1: np.percentile(x, 99, axis=axis)
+            return _stat_p99
         case _:
             assert_never(statistic)
 
