@@ -4,7 +4,7 @@ description: "Run an ARF task through all required stages and merge the final PR
 ---
 # Execute Task
 
-**Version**: 24
+**Version**: 25
 
 ## Goal
 
@@ -15,60 +15,266 @@ Execute a complete task through all mandatory stages and finish with a merged PR
 
 * `$TASK_ID` — the task folder name (e.g., `t0003_download_semcor_dataset`)
 
-## Context
+* * *
 
-Read before starting:
+# Part A — Coordinator
 
-* `project/description.md` — project goals, scope, and research questions
+The coordinator is a thin orchestrator. It reads three files, spawns a fresh step-executor Agent for
+each pending step, and handles only Phase −1 (liveness) and Phases 7-9 (PR/merge/overview) inline.
 
-* `project/budget.json` — project budget and per-task spending limits
+## Coordinator Context
 
-* `arf/specifications/project_budget_specification.md` — `project/budget.json` schema and threshold
-  rules
+Read before starting **and at every wakeup**:
 
-* `tasks/$TASK_ID/task.json` — task objective, dependencies, expected assets
+* `tasks/$TASK_ID/task.json` — task objective and dependencies
+* `tasks/$TASK_ID/step_tracker.json` — current step state (may not exist on first run)
+* `tasks/$TASK_ID/checkpoint.md` — accumulated step decisions (may not exist on first run)
 
-* `arf/specifications/task_steps_specification.md` — canonical step IDs and phase order
+Do NOT read specification files, plan files, research files, or step logs. Those are loaded by
+step-executors only.
 
-* `arf/specifications/task_git_specification.md` — branching, commit, and PR conventions
+## Phase −1: Wakeup begins with a liveness scan
 
-* `arf/specifications/task_file_specification.md` — `task.json` format
+This phase runs at the very start of every invocation of `execute-task`, including the first one on
+a fresh task, every resume from `/loop` or `ScheduleWakeup`, and every continuation after a subagent
+handoff. It must execute before any other phase.
 
-* `arf/specifications/logs_specification.md` — log directory structure
+1. Run the liveness verificator:
 
-* `arf/specifications/research_papers_specification.md` — `research_papers.md` format
+   ```bash
+   uv run python -m arf.scripts.verificators.verify_step_liveness --all
+   ```
 
-* `arf/specifications/research_internet_specification.md` — `research_internet.md` format
+   Exit code `0` means no stuck step was detected — proceed to Phase 0.
 
-* `arf/specifications/research_code_specification.md` — `research_code.md` format
+2. If the verificator returns non-zero, a step needs recovery before any new work. Two error codes
+   can appear:
 
-* `arf/specifications/plan_specification.md` — `plan.md` format
+   * `ST-E007` — an `in_progress` step has a stale heartbeat AND a live VM is still provisioned: the
+     idle-billing emergency.
+   * `ST-E008` — a `paused_waiting` step has `watchdog_active != true`: an unsafe pause. Either
+     confirm/install the idle watchdog and set `watchdog_active`, or drive the step synchronously /
+     transition it to `blocked_intervention`. Never leave a step paused without a watchdog.
 
-* `arf/specifications/compare_literature_specification.md` — `compare_literature.md` format (for
-  tasks that include the compare-literature step)
+   Do not continue with Phase 0. Instead:
 
-* `arf/docs/howto/use_aggregators.md` — JSON output structure for all aggregators
+   * Identify the offending `task_id` and `step_number` from the verificator output.
+   * Invoke `/diagnose-stuck-step` inline (do NOT delegate to a fresh subagent — the coordinator
+     owns the recovery) with that `task_id` and `step_number`. The skill produces a structured
+     report at `tasks/<task_id>/logs/diagnostics/<timestamp>_<step>.json` and prints its path.
+   * Read the diagnostic report. Act on its `recommended_action`:
+     * `resume_inline` — drive the stuck step's work inline (no new subagent), then mark it
+       completed via `arf.scripts.utils.heartbeat.complete_step`.
+     * `teardown_and_restart` — invoke the teardown step from `setup-remote-machine`, then either
+       restart the work inline or transition the step to `blocked_intervention` with a written
+       intervention file describing the failure and what the human should look at.
+     * `intervention_required` — transition the step to `blocked_intervention` with the diagnostic
+       report path referenced.
 
-* Task type definitions via aggregator — determines which optional steps apply:
+3. Warnings only (`ST-W005` or `ST-W006` without `ST-E007`): there is no live VM burning money, but
+   a step is ghosted or pathologically slow. Run `/diagnose-stuck-step` inline as above, then act on
+   the report. The cost pressure is lower but the coordinator still owns the recovery.
 
-  ```bash
-  uv run python -u -m arf.scripts.aggregators.aggregate_task_types --format json
-  ```
+4. After acting on every flagged step, re-run `verify_step_liveness --all`. Only when it returns `0`
+   may the coordinator proceed to Phase 0.
 
-  Returns `{"task_types": [{"task_type_id", "name", "optional_steps", "instruction", ...}]}`. Access
-  task types via `data["task_types"]`.
+5. Resume paused steps. Scan every `step_tracker.json` for steps with status `paused_waiting`. These
+   pass the liveness verificator (their VM is watchdog-protected), so they do **not** appear in step
+   1's output — the coordinator must find them explicitly. For each, in task order:
 
-* Current project spend and budget left — run after the worktree is created:
+   * If `now < resume_after`: the wait is not over. Register one `ScheduleWakeup` for the earliest
+     `resume_after` across all paused steps and STOP this invocation — do not start Phase 0 work.
+     The VM's idle watchdog protects spend in the meantime.
+   * If `now >= resume_after`: re-dispatch the step's skill (e.g. `/implementation`) in resume mode
+     — spawn its subagent, passing the step's `resume_sentinel` and instructions to re-check it. The
+     skill then either drives the step to a terminal state or calls `pause_step` again with a new
+     `resume_after`.
 
-  ```bash
-  uv run python -u -m arf.scripts.aggregators.aggregate_costs --format json --detail full
-  ```
+   Only when no `paused_waiting` step remains pending resume may the coordinator proceed to Phase 0.
 
-  Returns `{"budget": {...}, "summary": {...}, "tasks": [...], "skipped_tasks": [...]}`. Key fields
-  in `summary`: `total_cost_usd`, `budget_left_usd`, `spent_percent`, `stop_threshold_reached`,
-  `warn_threshold_reached`.
+Critical rule: NEVER re-delegate **recovery** (ghosted/emergency steps from steps 2-3) to a fresh
+subagent — drive it inline (the failure mode behind the 9-hour idle incident, `LESSONS.md` Lesson
+9). This is distinct from the sanctioned **resume** path in step 5: a `paused_waiting` step on a
+watchdog-protected VM may legitimately end the session and resume on a scheduled wakeup, because the
+watchdog — not the coordinator — is what guarantees the VM cannot run away.
 
-* Asset type specifications in `meta/asset_types/` for the expected assets
+## Coordinator Loop
+
+### Phase 0: Bootstrap
+
+1. Read `tasks/$TASK_ID/task.json` using the Read tool — note the objective, dependencies, and
+   `task_types`.
+2. Read `tasks/$TASK_ID/step_tracker.json` if it exists — find the next pending step. If it does not
+   exist, skip to the step loop: the first step-executor (`create-branch`) will create it.
+3. Read `tasks/$TASK_ID/checkpoint.md` if it exists.
+   * If `step_tracker.json` has completed steps but `checkpoint.md` is absent, this is a pre-v25
+     task. Synthesize a minimal `checkpoint.md` before spawning the next step-executor — see
+     **Resume of Pre-v25 Tasks** below.
+
+### Step Loop
+
+For each step with status `"pending"` in `step_tracker.json`, in step order:
+
+1. Determine `step_id` and `step_number` from `step_tracker.json`.
+2. Spawn a step-executor Agent using the **Step-Executor Prompt Template**, substituting `$TASK_ID`,
+   `$STEP_ID`, `$STEP_NUMBER`, `$SHORT_DESCRIPTION`, and the full contents of
+   `tasks/$TASK_ID/checkpoint.md`.
+3. Wait for the step-executor to return `{"status": "...", "notes": "..."}`.
+4. On `"completed"`: re-read `step_tracker.json` to confirm the step is marked `completed`. If
+   `step_id` was `create-branch`, also create `tasks/$TASK_ID/checkpoint.md` — see **Coordinator
+   Creates Checkpoint After Step 1** below. Proceed to next pending step.
+5. On `"failed"`: report to user with the `notes` field and stop.
+6. On `"paused"`: verify `step_tracker.json` shows `paused_waiting` with `watchdog_active: true`.
+   Register `ScheduleWakeup` for `resume_after`. Stop this invocation.
+
+### Phases 7-9: Inline
+
+After all steps complete (all `step_tracker.json` entries are `completed` or `skipped`), execute
+Phases 7, 8, and 9 inline in the coordinator. Do not spawn step-executors for these phases. See
+Phase 7, 8, and 9 instructions in Part B.
+
+## Coordinator Creates Checkpoint After Step 1
+
+After `create-branch` (step 1) completes, the coordinator writes `tasks/$TASK_ID/checkpoint.md`:
+
+```yaml
+---
+spec_version: "1"
+task_id: "$TASK_ID"
+updated_at: "<ISO8601 UTC>"
+completed_steps: 1
+next_step_number: 2
+next_step_id: "<step-2-id from step_tracker.json>"
+---
+```
+
+```markdown
+# Task Objective
+<short_description from task.json>
+
+---
+
+## Step History
+
+### Step 1 — create-branch
+Branch `task/$TASK_ID` created. Initial folder structure initialized in `tasks/$TASK_ID/`.
+Step 1 is a mechanical setup step with no research output.
+
+---
+
+## Cross-Step Decisions
+
+---
+
+## Next Step Notes
+Step 1 completed successfully. The task branch and folder are ready. Proceed to step 2 per
+step_tracker.json.
+```
+
+Run `uv run flowmark --inplace --nobackup tasks/$TASK_ID/checkpoint.md`. Commit with message:
+`$TASK_ID [coordinator]: Initialize checkpoint.md after step 1`
+
+## Resume of Pre-v25 Tasks
+
+When `step_tracker.json` has completed steps but `checkpoint.md` is absent:
+
+1. Read `step_tracker.json` and `tasks/$TASK_ID/task.json`.
+2. Write `tasks/$TASK_ID/checkpoint.md` with:
+   * Frontmatter: `spec_version: "1"`, `task_id: "$TASK_ID"`, `updated_at: <now>`,
+     `completed_steps: <count of completed+skipped steps>`,
+     `next_step_number: <next pending step number>`, `next_step_id: <next pending step id>`.
+   * `# Task Objective`: `short_description` from `task.json`.
+   * `## Step History`: one `### Step N — <step-id>` entry per completed or skipped step, body:
+     `"Synthesized for v25 resume — no detail available."`.
+   * `## Cross-Step Decisions`: empty.
+   * `## Next Step Notes`:
+     `"Resuming pre-v25 task. Prior step details unavailable; read plan.md and step logs for context."`
+3. Run `uv run flowmark --inplace --nobackup tasks/$TASK_ID/checkpoint.md`.
+4. Commit: `$TASK_ID [coordinator]: Synthesize checkpoint.md for v25 resume`
+
+## Step-Executor Prompt Template
+
+Use this exact template when spawning step-executors. Fill in all placeholders.
+
+```text
+You are a step-executor for ARF task $TASK_ID.
+
+Your assignment: execute step $STEP_NUMBER — "$STEP_ID"
+
+Task objective: $SHORT_DESCRIPTION
+
+Accumulated context (checkpoint.md):
+---
+$CHECKPOINT_MD_CONTENTS
+---
+
+Instructions:
+1. Read arf/skills/execute-task/SKILL.md — find "Part B — Step-Executor" and follow the protocol
+   for the "$STEP_ID" step.
+2. Load only the specs listed for "$STEP_ID" in the Per-Step Spec Table in that same file. Do not
+   read other specs.
+3. Complete the step, update checkpoint.md if step_order >= 2, commit all work, run poststep.
+4. Return exactly one of:
+   {"status": "completed", "notes": "<one sentence summary>"}
+   {"status": "failed", "notes": "<failure reason>"}
+   {"status": "paused", "notes": "<resume sentinel and ETA>"}
+```
+
+## Per-Step Spec Table
+
+Each step-executor reads only the specs listed here. No other spec files.
+
+| Step ID | Specs to read |
+| --- | --- |
+| `create-branch` | `task_steps_specification.md`, `task_git_specification.md`, `task_file_specification.md`, `logs_specification.md`, `project_budget_specification.md` |
+| `check-deps` | `logs_specification.md` |
+| `init-folders` | `task_file_specification.md`, `logs_specification.md` |
+| `research-papers` | `research_papers_specification.md`, `logs_specification.md` |
+| `research-internet` | `research_internet_specification.md`, `logs_specification.md` |
+| `research-code` | `research_code_specification.md`, `logs_specification.md` |
+| `planning` | `plan_specification.md`, `project_budget_specification.md`, `logs_specification.md` |
+| `setup-machines` | `remote_machines_specification.md`, `logs_specification.md` |
+| `implementation` | `plan/plan.md`, asset specs for each expected asset type in `task.json`, `logs_specification.md` |
+| `teardown` | `remote_machines_specification.md`, `logs_specification.md` |
+| `creative-thinking` | `logs_specification.md` |
+| `results` | `task_results_specification.md`, `logs_specification.md` |
+| `compare-literature` | `compare_literature_specification.md`, `logs_specification.md` |
+| `suggestions` | `logs_specification.md` |
+| `reporting` | `task_results_specification.md`, `logs_specification.md` |
+
+* * *
+
+# Part B — Step-Executor
+
+A step-executor is a fresh Agent spawned for exactly one step. Read only the files listed for your
+step in the Per-Step Spec Table and the `checkpoint.md` contents passed in your prompt. Do not load
+other spec files, plan files from other tasks, or research files outside your step's scope.
+
+## Step-Executor Protocol
+
+Every step follows this exact sequence:
+
+1. `uv run python -m arf.scripts.utils.prestep $TASK_ID $STEP_ID`
+2. Do the step work (see your step's phase below). For skill invocations, spawn a subagent per Rule
+   9\.
+3. *(step_order ≥ 2 only)* Update `tasks/$TASK_ID/checkpoint.md`: a. Append
+   `### Step $STEP_NUMBER — $STEP_ID` to `## Step History` (max 3 sentences: decision made, key
+   output file, any caveat for downstream). b. Add downstream-impacting decisions to
+   `## Cross-Step Decisions` (GPU tier, dataset variant, budget authorization, risk deviation). Do
+   not add routine completions. c. Overwrite `## Next Step Notes` entirely (3-5 sentences for the
+   next step-executor by name). d. Update frontmatter: `updated_at` (ISO8601 UTC), `completed_steps`
+   (count of completed+skipped steps after this step), `next_step_number`, `next_step_id` (from
+   `step_tracker.json`; use `null` when this is the last step). e.
+   `uv run flowmark --inplace --nobackup tasks/$TASK_ID/checkpoint.md`
+4. `uv run flowmark --inplace --nobackup` on all `.md` files created or modified in this step.
+   `uv run ruff check --fix . && uv run ruff format .` on any `.py` files.
+5. Stage all step work files **including `checkpoint.md`** (step_order ≥ 2) and `step_tracker.json`.
+6. Commit: `$TASK_ID [$STEP_ID]: <description>`
+7. `uv run python -m arf.scripts.utils.poststep $TASK_ID $STEP_ID`
+8. Return `{"status": "completed", "notes": "<one sentence>"}`.
+
+*(Step 1 `create-branch` is exempt from protocol step 3. The coordinator creates `checkpoint.md`
+after `create-branch` completes — see Part A.)*
 
 ## Critical Rules
 
@@ -91,20 +297,19 @@ Read before starting:
 
 7. Commit after each step with format: `<task_id> [<step_id>]: <description>`.
 
-8. The orchestrator owns the step lifecycle. Step skills (e.g., `/research-papers`,
+8. The coordinator owns the step lifecycle. Step skills (e.g., `/research-papers`,
    `/implementation`, `/generate-suggestions`) only produce output and run their verificator.
-   Prestep, commit, step log, and poststep are always handled here — never inside the step skill.
+   Prestep, commit, step log, and poststep are always handled by the step-executor — never inside
+   the step skill.
 
-9. Every skill invocation must run in a spawned subagent. When a step uses a skill (e.g.,
-   `/research-papers`, `/research-internet`, `/implementation`, `/add-paper`,
-   `/generate-suggestions`), always spawn a dedicated Agent. Never execute skill logic inline in the
-   orchestrator. When producing multiple assets of the same type, spawn one subagent per asset. This
-   protects the orchestrator's context and enforces isolation.
+9. Every skill invocation AND every task step must run in a spawned subagent. When a step uses a
+   skill (e.g., `/research-papers`, `/research-internet`, `/implementation`, `/add-paper`,
+   `/generate-suggestions`), always spawn a dedicated Agent. Never execute skill logic inline. When
+   producing multiple assets of the same type, spawn one subagent per asset.
 
 10. Never override or restrict a skill's instructions when spawning its subagent. Pass the task ID
     and any required context, but do not add constraints like "do NOT add papers" or "skip Phase 3".
-    The skill's `SKILL.md` defines what it does — the orchestrator must not second-guess or
-    abbreviate it.
+    The skill's `SKILL.md` defines what it does — the orchestrator must not second-guess it.
 
 11. Post-merge overview sync happens only on `main` in the main repo. Rebuild, commit, and push
     `overview/` only after the task PR is merged, the worktree is removed, and `main` is updated.
@@ -124,6 +329,17 @@ Read before starting:
     PR, and the audit trail for every earlier step is corrupted. To recover from an oversized file
     caught by `verify_pr_premerge` (PM-E011, 5 MB threshold), compress the file in place and create
     a normal follow-up commit — see Phase 7 Step 3.
+
+15. The coordinator reads ONLY `task.json`, `step_tracker.json`, and `checkpoint.md`. It never reads
+    specification files, plan files, research files, or step logs. Those are loaded by
+    step-executors only.
+
+16. Each step is executed by a fresh step-executor Agent. The coordinator never executes step work
+    inline, except Phase −1 (liveness scan) and Phases 7-9 (PR/merge/overview).
+
+17. Every step-executor at step_order ≥ 2 must update `checkpoint.md` and include it in the step
+    commit before calling poststep. Poststep will fail if `checkpoint.md` is absent or inconsistent
+    with `step_tracker.json`.
 
 ## Writing Code
 
@@ -146,17 +362,17 @@ When the plan calls for writing code, the `plan/plan.md` Step by Step section mu
 
 ## Step Lifecycle
 
-Every step follows this exact sequence:
+Every step follows this exact sequence (see also Step-Executor Protocol for the full lifecycle):
 
 ```text
 1. uv run python -m arf.scripts.utils.prestep  $TASK_ID <step_id>
 2. Do the step work
-3. CRITICAL: Run `uv run flowmark --inplace --nobackup` on ALL `.md` files created or modified in
-   this step — including `step_log.md` and any other files the orchestrator writes directly, not
-   just subagent output. Run `uv run ruff check --fix . && uv run ruff format .` on any `.py`
-   files. The pre-commit hook rejects commits with unformatted `.md` files.
-4. Commit the step work (include step_tracker.json — see note below)
-5. uv run python -m arf.scripts.utils.poststep $TASK_ID <step_id>
+3. (step_order >= 2) Update checkpoint.md — see Step-Executor Protocol step 3
+4. CRITICAL: Run `uv run flowmark --inplace --nobackup` on ALL `.md` files created or modified in
+   this step — including `step_log.md` and any other files the step-executor writes directly.
+   Run `uv run ruff check --fix . && uv run ruff format .` on any `.py` files.
+5. Commit the step work (include step_tracker.json and checkpoint.md — see note below)
+6. uv run python -m arf.scripts.utils.poststep $TASK_ID <step_id>
    (auto-commits `step_tracker.json`)
 ```
 
@@ -169,7 +385,7 @@ mypy invocation triggers duplicate-module-name errors across task folders unless
 every task unchanged.
 
 **`step_tracker.json` staging rule**: `prestep` modifies `step_tracker.json` (sets the step status
-to `in_progress`). Stage `step_tracker.json` along with your step work files in step 4 so that
+to `in_progress`). Stage `step_tracker.json` along with your step work files in step 5 so that
 `poststep` finds a clean working tree. `poststep` then modifies `step_tracker.json` again (marks the
 step `completed`) and auto-commits that change. Do not make a separate manual commit for
 `step_tracker.json` — just include it in your normal step work commit.
@@ -208,73 +424,7 @@ prestep for the next active step — prestep requires a clean working tree.
 
 ## Steps
 
-### Phase −1: Wakeup begins with a liveness scan
-
-This phase runs at the very start of every invocation of `execute-task`, including the first one on
-a fresh task, every resume from `/loop` or `ScheduleWakeup`, and every continuation after a subagent
-handoff. It must execute before any other phase.
-
-1. Run the liveness verificator:
-
-   ```bash
-   uv run python -m arf.scripts.verificators.verify_step_liveness --all
-   ```
-
-   Exit code `0` means no stuck step was detected — proceed to step 5 (resume scan).
-
-2. If the verificator returns non-zero, a step needs recovery before any new work. Two error codes
-   can appear:
-
-   * `ST-E007` — an `in_progress` step has a stale heartbeat AND a live VM is still provisioned: the
-     idle-billing emergency.
-   * `ST-E008` — a `paused_waiting` step has `watchdog_active != true`: an unsafe pause. Either
-     confirm/install the idle watchdog and set `watchdog_active`, or drive the step synchronously /
-     transition it to `blocked_intervention`. Never leave a step paused without a watchdog.
-
-   Do not continue with Phase 0. Instead:
-
-   * Identify the offending `task_id` and `step_number` from the verificator output.
-   * Invoke `/diagnose-stuck-step` inline (do NOT delegate to a fresh subagent — the orchestrator
-     owns the recovery) with that `task_id` and `step_number`. The skill produces a structured
-     report at `tasks/<task_id>/logs/diagnostics/<timestamp>_<step>.json` and prints its path.
-   * Read the diagnostic report. Act on its `recommended_action`:
-     * `resume_inline` — drive the stuck step's work inline (no new subagent), then mark it
-       completed via `arf.scripts.utils.heartbeat.complete_step`.
-     * `teardown_and_restart` — invoke the teardown step from `setup-remote-machine`, then either
-       restart the work inline or transition the step to `blocked_intervention` with a written
-       intervention file describing the failure and what the human should look at.
-     * `intervention_required` — transition the step to `blocked_intervention` with the diagnostic
-       report path referenced.
-
-3. Warnings only (`ST-W005` or `ST-W006` without `ST-E007`): there is no live VM burning money, but
-   a step is ghosted or pathologically slow. Run `/diagnose-stuck-step` inline as above, then act on
-   the report. The cost pressure is lower but the orchestrator still owns the recovery.
-
-4. After acting on every flagged step, re-run `verify_step_liveness --all`. Only when it returns `0`
-   may the orchestrator proceed to step 5.
-
-5. Resume paused steps. Scan every `step_tracker.json` for steps with status `paused_waiting`. These
-   pass the liveness verificator (their VM is watchdog-protected), so they do **not** appear in step
-   1's output — the orchestrator must find them explicitly. For each, in task order:
-
-   * If `now < resume_after`: the wait is not over. Register one `ScheduleWakeup` for the earliest
-     `resume_after` across all paused steps and STOP this invocation — do not start Phase 0 work.
-     The VM's idle watchdog protects spend in the meantime.
-   * If `now >= resume_after`: re-dispatch the step's skill (e.g. `/implementation`) in resume mode
-     — spawn its subagent, passing the step's `resume_sentinel` and instructions to re-check it. The
-     skill then either drives the step to a terminal state or calls `pause_step` again with a new
-     `resume_after`.
-
-   Only when no `paused_waiting` step remains pending resume may the orchestrator proceed to Phase
-   0\.
-
-Critical rule: NEVER re-delegate **recovery** (ghosted/emergency steps from steps 2-3) to a fresh
-subagent — drive it inline (the failure mode behind the 9-hour idle incident, `LESSONS.md` Lesson
-9). This is distinct from the sanctioned **resume** path in step 5: a `paused_waiting` step on a
-watchdog-protected VM may legitimately end the session and resume on a scheduled wakeup, because the
-watchdog — not the orchestrator — is what guarantees the VM cannot run away.
-
-### Phase 0: Preparation (before any steps)
+### Phase 0: Preparation (create-branch step-executor scope)
 
 Phase 0 critical rule: use only the Read tool to read files. Do not run any CLI commands (`uv run`,
 `python`, aggregator scripts) before the worktree is created. Commands wrapped with
@@ -533,7 +683,7 @@ worktree_path: <worktree_path>
 created_at: <ISO8601_UTC>
 ```
 
-Commit and run poststep.
+Commit and run poststep. The coordinator then creates `checkpoint.md` — see Part A.
 
 #### Step: `check-deps`
 
@@ -557,7 +707,7 @@ Prestep runs `verify_task_dependencies.py` automatically. Write the output to
 }
 ```
 
-Commit and run poststep.
+Update `checkpoint.md`, commit, and run poststep.
 
 #### Step: `init-folders`
 
@@ -598,9 +748,9 @@ uv run python -m arf.scripts.utils.run_with_logs --task-id $TASK_ID -- \
 ```
 
 Stage both the created directories (including `.gitkeep` files) and the step log directory
-(`tasks/$TASK_ID/logs/steps/003_init-folders/`), then commit and run poststep. Do not stage
-`tasks/$TASK_ID/ctx/` — these cache files are gitignored and intentionally local-only; they are
-consumed within this session but not committed to the branch.
+(`tasks/$TASK_ID/logs/steps/003_init-folders/`), update `checkpoint.md`, then commit and run
+poststep. Do not stage `tasks/$TASK_ID/ctx/` — these cache files are gitignored and intentionally
+local-only; they are consumed within this session but not committed to the branch.
 
 These cache files are the source of truth for this task run. Subagents read them instead of
 re-running aggregators. Exception: if this task adds or edits `meta/` content (new metric, category,
@@ -637,8 +787,8 @@ uv run python -m arf.scripts.utils.run_with_logs --task-id $TASK_ID -- \
   uv run python -m arf.scripts.verificators.verify_research_papers $TASK_ID
 ```
 
-Write `logs/steps/NNN_research-papers/step_log.md`. Commit and run poststep. If skipped, the step
-must still appear in `step_tracker.json` with status `"skipped"`.
+Update `checkpoint.md`, write `logs/steps/NNN_research-papers/step_log.md`, commit, and run
+poststep. If skipped, the step must still appear in `step_tracker.json` with status `"skipped"`.
 
 #### Step: `research-internet` (optional)
 
@@ -669,8 +819,8 @@ uv run python -m arf.scripts.utils.run_with_logs --task-id $TASK_ID -- \
   uv run python -m arf.scripts.verificators.verify_research_internet $TASK_ID
 ```
 
-Write `logs/steps/NNN_research-internet/step_log.md`. Commit and run poststep. If skipped, the step
-must still appear in `step_tracker.json` with status `"skipped"`.
+Update `checkpoint.md`, write step log, commit, and run poststep. If skipped, the step must still
+appear in `step_tracker.json` with status `"skipped"`.
 
 **Paper addition from Discovered Papers**: After the research-internet step completes successfully,
 parse the `## Discovered Papers` section of `research/research_internet.md`. For each paper listed
@@ -733,8 +883,8 @@ step_tracker entry — run it inline after the last research step completes.
 
 Log this under the last research step that actually ran (research-code, or research-internet /
 research-papers if research-code was skipped): append a note to that step's
-`tasks/$TASK_ID/logs/steps/NNN_<step>/step_log.md`. Stage both that step log and
-`tasks/$TASK_ID/research/research_summary.md`, then commit and run poststep.
+`tasks/$TASK_ID/logs/steps/NNN_<step>/step_log.md`. Update `checkpoint.md`. Stage both that step log
+and `tasks/$TASK_ID/research/research_summary.md`, then commit and run poststep.
 
 ### Phase 3: Planning
 
@@ -775,8 +925,8 @@ uv run python -m arf.scripts.utils.run_with_logs --task-id $TASK_ID -- \
   uv run python -m arf.scripts.verificators.verify_plan $TASK_ID
 ```
 
-Write `logs/steps/NNN_planning/step_log.md`. Commit and run poststep. If skipped, the step must
-still appear in `step_tracker.json` with status `"skipped"`.
+Update `checkpoint.md`, write step log, commit, and run poststep. If skipped, the step must still
+appear in `step_tracker.json` with status `"skipped"`.
 
 ### Phase 4: Execution
 
@@ -808,8 +958,8 @@ After the subagent completes, verify:
 
 * SSH connection and GPU verified (check the `gpu_verified` field)
 
-Write step log. Commit and run poststep. If skipped, the step must still appear in
-`step_tracker.json` with status `"skipped"`.
+Update `checkpoint.md`, write step log, commit, and run poststep. If skipped, the step must still
+appear in `step_tracker.json` with status `"skipped"`.
 
 #### Step: `implementation`
 
@@ -835,7 +985,7 @@ For experiment tasks with multiple variants, check cumulative API cost after eac
 completes. If the plan specifies a budget cap, compare the running total against it. If the cap is
 exceeded, stop further variant runs and document the overrun in `results/costs.json` `note` field.
 
-Write step log. Commit and run poststep.
+Update `checkpoint.md`, write step log, commit, and run poststep.
 
 #### Step: `teardown` (optional)
 
@@ -870,14 +1020,14 @@ After the subagent completes, verify:
     --task-id $TASK_ID
   ```
 
-Write step log. Commit and run poststep.
+Update `checkpoint.md`, write step log, commit, and run poststep.
 
 ### Phase 5: Analysis
 
 #### Step: `creative-thinking` (optional)
 
-Out-of-the-box analysis and alternative approaches. If skipped, the step must still appear in
-`step_tracker.json` with status `"skipped"`.
+Out-of-the-box analysis and alternative approaches. Update `checkpoint.md`. If skipped, the step
+must still appear in `step_tracker.json` with status `"skipped"`.
 
 #### Step: `results`
 
@@ -984,7 +1134,7 @@ contradict any stated assumption, hypothesis, or prior-task claim, document the 
 prominently in `results_detailed.md` under `## Analysis`. Contradicted assumptions are findings —
 they must be reported, not buried.
 
-Write step log. Commit and run poststep.
+Update `checkpoint.md`, write step log, commit, and run poststep.
 
 #### Step: `compare-literature` (optional)
 
@@ -1013,7 +1163,8 @@ uv run python -m arf.scripts.utils.run_with_logs --task-id $TASK_ID -- \
   uv run python -m arf.scripts.verificators.verify_compare_literature $TASK_ID
 ```
 
-Fix all errors. Re-run until zero errors. Write step log. Commit and run poststep.
+Fix all errors. Re-run until zero errors. Update `checkpoint.md`, write step log, commit, and run
+poststep.
 
 ### Phase 6: Reporting
 
@@ -1040,7 +1191,8 @@ uv run python -m arf.scripts.utils.run_with_logs --task-id $TASK_ID -- \
   uv run python -m arf.scripts.verificators.verify_suggestions $TASK_ID
 ```
 
-Fix all errors. Re-run until zero errors. Write step log. Commit and run poststep.
+Fix all errors. Re-run until zero errors. Update `checkpoint.md`, write step log, commit, and run
+poststep.
 
 #### Step: `reporting`
 
@@ -1087,9 +1239,12 @@ uv run python -m arf.scripts.utils.prestep $TASK_ID reporting
 3. Update `task.json`: set `status` to `"completed"` and set `end_time`. Note: `start_time` is
    already set by `worktree create` — do not overwrite it.
 
-4. Write step log. Commit and run poststep.
+4. Update `checkpoint.md` (this is the final update: set `next_step_number` and `next_step_id` to
+   `null`, update `completed_steps`). Write step log. Commit and run poststep.
 
 ### Phase 7: PR and Merge
+
+*(Executed inline by the coordinator after all steps complete.)*
 
 1. Push the task branch:
 
@@ -1173,6 +1328,8 @@ uv run python -m arf.scripts.utils.prestep $TASK_ID reporting
 
 ### Phase 8: Final Verification
 
+*(Executed inline by the coordinator.)*
+
 Run the completion verificator from the main repo (after worktree removal and `git pull`) to confirm
 everything is in order:
 
@@ -1190,6 +1347,8 @@ The reporting-step capture (Phase 6 Step 2) is the final session capture for the
 this point mutates a task whose branch has already been merged.
 
 ### Phase 9: Overview Sync
+
+*(Executed inline by the coordinator.)*
 
 After `verify_task_complete.py` passes, refresh the generated overview from the main repo on `main`:
 
@@ -1289,3 +1448,10 @@ After `verify_task_complete.py` passes, refresh the generated overview from the 
   file in place and commit forward (see Critical Rule 14 and Phase 7 Step 3)
 
 * NEVER rebuild, commit, or push `overview/` from a task branch or task worktree
+
+* NEVER have the coordinator read specification files, plan files, research files, or step logs —
+  those are step-executor scope only (Rule 15)
+
+* NEVER execute step work inline in the coordinator — always spawn a step-executor Agent (Rule 16)
+
+* NEVER commit a step without updating `checkpoint.md` for step_order ≥ 2 (Rule 17)
