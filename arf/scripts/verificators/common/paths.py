@@ -290,6 +290,10 @@ def session_capture_report_path(*, task_id: str) -> Path:
     return session_logs_dir(task_id=task_id) / "capture_report.json"
 
 
+def checkpoint_path(*, task_id: str) -> Path:
+    return TASKS_DIR / task_id / "checkpoint.md"
+
+
 def step_tracker_path(*, task_id: str) -> Path:
     return TASKS_DIR / task_id / "step_tracker.json"
 
