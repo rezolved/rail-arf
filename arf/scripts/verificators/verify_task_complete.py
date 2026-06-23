@@ -588,6 +588,14 @@ def verify_task_complete(*, task_id: str) -> VerificationResult:
             file_path=file_path,
         ),
     )
+    diagnostics.extend(
+        _run_sub_verificator(
+            module_name="arf.scripts.verificators.verify_checkpoint",
+            args=[task_id],
+            label="verify_checkpoint",
+            file_path=file_path,
+        ),
+    )
 
     # Run machine destruction verificator if remote machines were used
     rm_file: Path = remote_machines_path(task_id=task_id)

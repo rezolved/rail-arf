@@ -1005,6 +1005,11 @@ def verify_pr_premerge(
             args=[task_id],
             label="verify_logs",
         ),
+        SubVerificatorCall(
+            module_name="arf.scripts.verificators.verify_checkpoint",
+            args=[task_id],
+            label="verify_checkpoint",
+        ),
     ]
 
     for call in sub_verificator_calls:
