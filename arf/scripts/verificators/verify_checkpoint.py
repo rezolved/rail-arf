@@ -81,6 +81,7 @@ STEP_TRACKER_FIELD_COMPLETED_AT: str = "completed_at"
 STATUS_COMPLETED: str = "completed"
 STATUS_SKIPPED: str = "skipped"
 STATUS_PENDING: str = "pending"
+STATUS_IN_PROGRESS: str = "in_progress"
 
 FILE_SIZE_LIMIT_BYTES: int = 10 * 1024  # 10 KB
 STEP_HISTORY_WORD_LIMIT: int = 100
@@ -186,6 +187,29 @@ def _next_pending_step(*, steps: list[dict[str, Any]]) -> dict[str, Any] | None:
         if step.get(STEP_TRACKER_FIELD_STATUS) == STATUS_PENDING:
             return step
     return None
+
+
+def _promote_in_progress_step(
+    *,
+    steps: list[dict[str, Any]],
+    step_id: str,
+) -> list[dict[str, Any]]:
+    """Return steps with the given in_progress step treated as completed.
+
+    Called from poststep before step_tracker.json is updated, so the step-executor's
+    checkpoint.md (which already counts this step as completed) can be verified without
+    CK-E006/CK-E007 false positives.
+    """
+    result: list[dict[str, Any]] = []
+    for step in steps:
+        if (
+            step.get(STEP_TRACKER_FIELD_STEP_ID) == step_id
+            and step.get(STEP_TRACKER_FIELD_STATUS) == STATUS_IN_PROGRESS
+        ):
+            result.append({**step, STEP_TRACKER_FIELD_STATUS: STATUS_COMPLETED})
+        else:
+            result.append(step)
+    return result
 
 
 def _latest_completed_at(*, completed: list[dict[str, Any]]) -> datetime | None:
@@ -301,37 +325,95 @@ def _check_task_id(
     ]
 
 
-def _check_next_step_number(
+def _check_next_step_fields(
     *,
     frontmatter: dict[str, Any],
     steps: list[dict[str, Any]],
     file_path: Path,
 ) -> list[Diagnostic]:
-    fm_next: object = frontmatter.get(FRONTMATTER_FIELD_NEXT_STEP_NUMBER)
-    if fm_next is None:
-        return []
-
+    fm_next_num: object = frontmatter.get(FRONTMATTER_FIELD_NEXT_STEP_NUMBER)
+    fm_next_id: object = frontmatter.get(FRONTMATTER_FIELD_NEXT_STEP_ID)
     next_pending: dict[str, Any] | None = _next_pending_step(steps=steps)
-    if next_pending is None:
-        return []
 
-    tracker_next: object = next_pending.get(STEP_TRACKER_FIELD_STEP)
-    if not isinstance(tracker_next, int):
-        return []
-    if not isinstance(fm_next, int):
-        return []
-    if fm_next == tracker_next:
-        return []
-    return [
-        Diagnostic(
-            code=CODE_CK_E005,
-            message=(
-                f"next_step_number {fm_next} does not match"
-                f" step_tracker.json next pending step {tracker_next}"
-            ),
-            file_path=file_path,
+    diagnostics: list[Diagnostic] = []
+
+    # Validate next_step_number
+    if fm_next_num is None and next_pending is not None:
+        tracker_next: object = next_pending.get(STEP_TRACKER_FIELD_STEP)
+        diagnostics.append(
+            Diagnostic(
+                code=CODE_CK_E005,
+                message=f"next_step_number is null but step {tracker_next} is still pending",
+                file_path=file_path,
+            )
         )
-    ]
+    elif fm_next_num is not None and next_pending is None:
+        diagnostics.append(
+            Diagnostic(
+                code=CODE_CK_E005,
+                message=f"next_step_number is {fm_next_num!r} but no pending steps remain",
+                file_path=file_path,
+            )
+        )
+    elif fm_next_num is not None and next_pending is not None:
+        if not isinstance(fm_next_num, int):
+            diagnostics.append(
+                Diagnostic(
+                    code=CODE_CK_E005,
+                    message=(
+                        f"next_step_number has wrong type:"
+                        f" expected int, got {type(fm_next_num).__name__}"
+                    ),
+                    file_path=file_path,
+                )
+            )
+        else:
+            tracker_next_num: object = next_pending.get(STEP_TRACKER_FIELD_STEP)
+            if isinstance(tracker_next_num, int) and fm_next_num != tracker_next_num:
+                diagnostics.append(
+                    Diagnostic(
+                        code=CODE_CK_E005,
+                        message=(
+                            f"next_step_number {fm_next_num} does not match"
+                            f" step_tracker.json next pending step {tracker_next_num}"
+                        ),
+                        file_path=file_path,
+                    )
+                )
+
+    # Validate next_step_id
+    if fm_next_id is None and next_pending is not None:
+        tracker_next_id: object = next_pending.get(STEP_TRACKER_FIELD_STEP_ID)
+        diagnostics.append(
+            Diagnostic(
+                code=CODE_CK_E005,
+                message=f"next_step_id is null but step '{tracker_next_id}' is still pending",
+                file_path=file_path,
+            )
+        )
+    elif fm_next_id is not None and next_pending is None:
+        diagnostics.append(
+            Diagnostic(
+                code=CODE_CK_E005,
+                message=f"next_step_id is {fm_next_id!r} but no pending steps remain",
+                file_path=file_path,
+            )
+        )
+    elif fm_next_id is not None and next_pending is not None:
+        tracker_next_id_str: object = next_pending.get(STEP_TRACKER_FIELD_STEP_ID)
+        if fm_next_id != tracker_next_id_str:
+            diagnostics.append(
+                Diagnostic(
+                    code=CODE_CK_E005,
+                    message=(
+                        f"next_step_id {fm_next_id!r} does not match"
+                        f" step_tracker.json next pending step_id {tracker_next_id_str!r}"
+                    ),
+                    file_path=file_path,
+                )
+            )
+
+    return diagnostics
 
 
 def _check_completed_steps_count(
@@ -341,8 +423,18 @@ def _check_completed_steps_count(
     file_path: Path,
 ) -> list[Diagnostic]:
     fm_count: object = frontmatter.get(FRONTMATTER_FIELD_COMPLETED_STEPS)
-    if not isinstance(fm_count, int):
+    if fm_count is None:
         return []
+    if not isinstance(fm_count, int):
+        return [
+            Diagnostic(
+                code=CODE_CK_E006,
+                message=(
+                    f"completed_steps has wrong type: expected int, got {type(fm_count).__name__}"
+                ),
+                file_path=file_path,
+            )
+        ]
     tracker_count: int = len(_completed_steps(steps=steps))
     if fm_count == tracker_count:
         return []
@@ -403,7 +495,8 @@ def _check_step_history(
                 Diagnostic(
                     code=CODE_CK_E007,
                     message=(
-                        f"Step History missing entry for completed step {step_num_obj} ({step_id})"
+                        f"Step History missing entry for completed or skipped step"
+                        f" {step_num_obj} ({step_id})"
                     ),
                     file_path=file_path,
                 )
@@ -505,7 +598,11 @@ def _check_task_objective(
     top_sections: list[MarkdownSection] = extract_sections(body=body, level=1)
     for section in top_sections:
         if section.heading.strip() == SECTION_TASK_OBJECTIVE:
-            if len(section.content.strip()) > 0:
+            # section.content spans until the next level-1 heading, so it includes all
+            # level-2 sub-sections (## Step History, etc.). Strip everything from the
+            # first sub-heading onward to get just the objective text.
+            objective_text: str = re.split(r"\n##", section.content, maxsplit=1)[0]
+            if re.search(r"\w", objective_text) is not None:
                 return []
             return [
                 Diagnostic(
@@ -528,11 +625,21 @@ def _check_task_objective(
 # ---------------------------------------------------------------------------
 
 
-def verify_checkpoint(*, task_id: str) -> VerificationResult:
+def verify_checkpoint(
+    *,
+    task_id: str,
+    current_step_id: str | None = None,
+) -> VerificationResult:
     file_path: Path = checkpoint_path(task_id=task_id)
     diagnostics: list[Diagnostic] = []
 
     steps: list[dict[str, Any]] = _load_step_tracker(task_id=task_id)
+
+    # When called from poststep, the current step is still in_progress in step_tracker.json
+    # even though checkpoint.md already counts it as completed. Promote it here so
+    # CK-E006/CK-E007 don't false-fire.
+    if current_step_id is not None:
+        steps = _promote_in_progress_step(steps=steps, step_id=current_step_id)
 
     # CK-E001: missing checkpoint
     existence_errors: list[Diagnostic] = _check_existence(
@@ -579,9 +686,9 @@ def verify_checkpoint(*, task_id: str) -> VerificationResult:
             )
         )
 
-        # CK-E005: next_step_number mismatch
+        # CK-E005: next_step_number / next_step_id mismatches
         diagnostics.extend(
-            _check_next_step_number(
+            _check_next_step_fields(
                 frontmatter=frontmatter,
                 steps=steps,
                 file_path=file_path,
@@ -647,9 +754,22 @@ def main() -> None:
         description="Verify checkpoint.md against the checkpoint specification.",
     )
     parser.add_argument("task_id", help="Task ID (e.g. t0007_build_model_qwen35_moe)")
+    parser.add_argument(
+        "--current-step-id",
+        dest="current_step_id",
+        default=None,
+        help=(
+            "step_id of the in_progress step being completed by poststep."
+            " Treats that step as completed so CK-E006/CK-E007 do not false-fire"
+            " before step_tracker.json is updated."
+        ),
+    )
     args: argparse.Namespace = parser.parse_args()
 
-    result: VerificationResult = verify_checkpoint(task_id=args.task_id)
+    result: VerificationResult = verify_checkpoint(
+        task_id=args.task_id,
+        current_step_id=args.current_step_id,
+    )
     print_verification_result(result=result)
     sys.exit(exit_code_for_result(result=result))
 

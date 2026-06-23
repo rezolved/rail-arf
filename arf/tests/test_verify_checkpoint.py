@@ -312,6 +312,225 @@ class TestCkE007MissingStepHistory:
         assert "CK-E007" in _codes(result)
 
 
+class TestCurrentStepIdPromotion:
+    def test_in_progress_step_promoted_passes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        step_2_in_progress: dict[str, object] = {
+            "step": 2,
+            "step_id": "research-papers",
+            "name": "Research Papers",
+            "status": "in_progress",
+            "started_at": "2026-06-23T14:30:00Z",
+            "last_heartbeat_at": "2026-06-23T14:45:00Z",
+            "heartbeat_interval_seconds": 60,
+            "expected_completion_at": "2026-06-23T15:30:00Z",
+        }
+        step_3_pending: dict[str, object] = {
+            "step": 3,
+            "step_id": "planning",
+            "name": "Planning",
+            "status": "pending",
+        }
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[_STEP_COMPLETED, step_2_in_progress, step_3_pending],
+        )
+        # checkpoint.md written by the step-executor — counts step 2 as completed already
+        content: str = (
+            "---\n"
+            'spec_version: "1"\n'
+            f'task_id: "{TASK_ID}"\n'
+            'updated_at: "2026-06-23T15:00:00Z"\n'
+            "completed_steps: 2\n"
+            "next_step_number: 3\n"
+            'next_step_id: "planning"\n'
+            "---\n"
+            "# Task Objective\nA test.\n\n"
+            "## Step History\n\n"
+            "### Step 1 — create-branch\nDone.\n\n"
+            "### Step 2 — research-papers\nResearched all relevant papers.\n\n"
+            "## Cross-Step Decisions\n\n"
+            "## Next Step Notes\nNext step.\n"
+        )
+        write_text(path=_checkpoint_path(repo_root=tmp_path), content=content)
+        # Without current_step_id: CK-E006 would fire
+        result_no_id: VerificationResult = _run()
+        assert "CK-E006" in _codes(result_no_id)
+        # With current_step_id: passes
+        result_with_id: VerificationResult = verify_mod.verify_checkpoint(
+            task_id=TASK_ID, current_step_id="research-papers"
+        )
+        assert result_with_id.passed, _codes(result_with_id)
+
+
+class TestCkE005NextStepFields:
+    def test_null_next_step_number_with_pending_step_fires(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[_STEP_COMPLETED, _STEP_PENDING],
+        )
+        content: str = (
+            "---\n"
+            'spec_version: "1"\n'
+            f'task_id: "{TASK_ID}"\n'
+            'updated_at: "2026-06-23T14:00:00Z"\n'
+            "completed_steps: 1\n"
+            "next_step_number: null\n"
+            'next_step_id: "research-papers"\n'
+            "---\n"
+            "# Task Objective\nA test.\n\n"
+            "## Step History\n\n### Step 1 — create-branch\nDone.\n\n"
+            "## Cross-Step Decisions\n\n"
+            "## Next Step Notes\nNext step.\n"
+        )
+        write_text(path=_checkpoint_path(repo_root=tmp_path), content=content)
+        result: VerificationResult = _run()
+        assert not result.passed
+        assert "CK-E005" in _codes(result)
+
+    def test_nonnull_next_step_number_with_no_pending_fires(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[_STEP_COMPLETED],
+        )
+        content: str = (
+            "---\n"
+            'spec_version: "1"\n'
+            f'task_id: "{TASK_ID}"\n'
+            'updated_at: "2026-06-23T14:00:00Z"\n'
+            "completed_steps: 1\n"
+            "next_step_number: 2\n"
+            "next_step_id: null\n"
+            "---\n"
+            "# Task Objective\nA test.\n\n"
+            "## Step History\n\n### Step 1 — create-branch\nDone.\n\n"
+            "## Cross-Step Decisions\n\n"
+            "## Next Step Notes\nLast step done.\n"
+        )
+        write_text(path=_checkpoint_path(repo_root=tmp_path), content=content)
+        result: VerificationResult = _run()
+        assert not result.passed
+        assert "CK-E005" in _codes(result)
+
+    def test_next_step_id_mismatch_fires(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[_STEP_COMPLETED, _STEP_PENDING],
+        )
+        content: str = (
+            "---\n"
+            'spec_version: "1"\n'
+            f'task_id: "{TASK_ID}"\n'
+            'updated_at: "2026-06-23T14:00:00Z"\n'
+            "completed_steps: 1\n"
+            "next_step_number: 2\n"
+            'next_step_id: "wrong-step-id"\n'
+            "---\n"
+            "# Task Objective\nA test.\n\n"
+            "## Step History\n\n### Step 1 — create-branch\nDone.\n\n"
+            "## Cross-Step Decisions\n\n"
+            "## Next Step Notes\nNext step.\n"
+        )
+        write_text(path=_checkpoint_path(repo_root=tmp_path), content=content)
+        result: VerificationResult = _run()
+        assert not result.passed
+        assert "CK-E005" in _codes(result)
+
+
+class TestCkE006CompletedStepsType:
+    def test_string_completed_steps_fires_type_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[_STEP_COMPLETED, _STEP_PENDING],
+        )
+        content: str = (
+            "---\n"
+            'spec_version: "1"\n'
+            f'task_id: "{TASK_ID}"\n'
+            'updated_at: "2026-06-23T14:00:00Z"\n'
+            'completed_steps: "1"\n'
+            "next_step_number: 2\n"
+            'next_step_id: "research-papers"\n'
+            "---\n"
+            "# Task Objective\nA test.\n\n"
+            "## Step History\n\n### Step 1 — create-branch\nDone.\n\n"
+            "## Cross-Step Decisions\n\n"
+            "## Next Step Notes\nNext step.\n"
+        )
+        write_text(path=_checkpoint_path(repo_root=tmp_path), content=content)
+        result: VerificationResult = _run()
+        assert not result.passed
+        assert "CK-E006" in _codes(result)
+
+
+class TestCkW004TaskObjective:
+    def test_empty_objective_with_subsections_fires(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[_STEP_COMPLETED, _STEP_PENDING],
+        )
+        # Objective text is empty — only the divider and sub-sections follow
+        content: str = (
+            "---\n"
+            'spec_version: "1"\n'
+            f'task_id: "{TASK_ID}"\n'
+            'updated_at: "2026-06-23T14:00:00Z"\n'
+            "completed_steps: 1\n"
+            "next_step_number: 2\n"
+            'next_step_id: "research-papers"\n'
+            "---\n"
+            "# Task Objective\n\n"
+            "---\n\n"
+            "## Step History\n\n### Step 1 — create-branch\nDone.\n\n"
+            "## Cross-Step Decisions\n\n"
+            "## Next Step Notes\nNext step.\n"
+        )
+        write_text(path=_checkpoint_path(repo_root=tmp_path), content=content)
+        result: VerificationResult = _run()
+        assert "CK-W004" in _codes(result)
+
+
 class TestCkW001SizeLimit:
     def test_checkpoint_over_10kb(
         self,

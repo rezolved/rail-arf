@@ -248,10 +248,16 @@ def run_poststep(*, task_id: str, step_id: str) -> int:
     _info("Step verification passed")
 
     # Run verify_checkpoint.py for step_order >= 2 (step 1 is exempt because the coordinator
-    # creates checkpoint.md after step 1 completes, so poststep for step 1 runs before it exists)
+    # creates checkpoint.md after step 1 completes, so poststep for step 1 runs before it exists).
+    # Pass --current-step-id so verify_checkpoint treats this step as completed even though
+    # step_tracker.json still shows it as in_progress at this point.
     if step_order >= 2:
+        tracker_step_id: object = step.get("step_id")
+        checkpoint_cmd: list[str] = ["uv", "run", "python", str(VERIFY_CHECKPOINT_SCRIPT), task_id]
+        if isinstance(tracker_step_id, str):
+            checkpoint_cmd += ["--current-step-id", tracker_step_id]
         checkpoint_result: subprocess.CompletedProcess[str] = subprocess.run(
-            ["uv", "run", "python", str(VERIFY_CHECKPOINT_SCRIPT), task_id],
+            checkpoint_cmd,
             capture_output=True,
             text=True,
             cwd=repo_root,
