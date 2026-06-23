@@ -49,6 +49,7 @@ STEP_LOG_FILENAME: str = "step_log.md"
 
 _SCRIPTS_DIR: Path = Path(__file__).resolve().parents[1]
 VERIFY_STEP_SCRIPT: Path = _SCRIPTS_DIR / "verificators" / "verify_step.py"
+VERIFY_CHECKPOINT_SCRIPT: Path = _SCRIPTS_DIR / "verificators" / "verify_checkpoint.py"
 
 
 def _detect_repo_root() -> Path:
@@ -245,6 +246,24 @@ def run_poststep(*, task_id: str, step_id: str) -> int:
             print(verify_result.stderr, file=sys.stderr)
         return 1
     _info("Step verification passed")
+
+    # Run verify_checkpoint.py for step_order >= 2 (step 1 is exempt because the coordinator
+    # creates checkpoint.md after step 1 completes, so poststep for step 1 runs before it exists)
+    if step_order >= 2:
+        checkpoint_result: subprocess.CompletedProcess[str] = subprocess.run(
+            ["uv", "run", "python", str(VERIFY_CHECKPOINT_SCRIPT), task_id],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+        )
+        if checkpoint_result.returncode != 0:
+            _error("Checkpoint verification failed:")
+            if len(checkpoint_result.stdout) > 0:
+                print(checkpoint_result.stdout)
+            if len(checkpoint_result.stderr) > 0:
+                print(checkpoint_result.stderr, file=sys.stderr)
+            return 1
+        _info("Checkpoint verification passed")
 
     # Check working tree is clean
     if not _is_working_tree_clean(repo_root=repo_root):
