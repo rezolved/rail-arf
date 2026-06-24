@@ -561,3 +561,77 @@ class TestCkW001SizeLimit:
         result: VerificationResult = _run()
         codes: list[str] = _codes(result)
         assert "CK-W001" in codes
+
+
+class TestCkW002OversizedStepHistoryEntry:
+    def test_oversized_entry_fires(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[_STEP_COMPLETED, _STEP_PENDING],
+        )
+        # 110 words in the step history entry — over the 100-word limit
+        long_entry: str = " ".join(["word"] * 110)
+        content: str = (
+            "---\n"
+            'spec_version: "1"\n'
+            f'task_id: "{TASK_ID}"\n'
+            'updated_at: "2026-06-23T14:00:00Z"\n'
+            "completed_steps: 1\n"
+            "next_step_number: 2\n"
+            'next_step_id: "research-papers"\n'
+            "---\n"
+            "# Task Objective\nA test.\n\n"
+            f"## Step History\n\n### Step 1 — create-branch\n{long_entry}\n\n"
+            "## Cross-Step Decisions\n\n"
+            "## Next Step Notes\nNext step.\n"
+        )
+        write_text(path=_checkpoint_path(repo_root=tmp_path), content=content)
+        result: VerificationResult = _run()
+        assert "CK-W002" in _codes(result)
+
+
+class TestCkW003UpdatedAtStaleness:
+    def test_stale_updated_at_fires(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        # Step completed at 14:00; checkpoint updated_at is earlier (13:00)
+        step_completed: dict[str, object] = {
+            "step": 1,
+            "name": "create-branch",
+            "status": "completed",
+            "completed_at": "2026-06-23T14:00:00Z",
+            "started_at": "2026-06-23T13:54:00Z",
+        }
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[step_completed],
+        )
+        content: str = (
+            "---\n"
+            'spec_version: "1"\n'
+            f'task_id: "{TASK_ID}"\n'
+            'updated_at: "2026-06-23T13:00:00Z"\n'
+            "completed_steps: 1\n"
+            "next_step_number: null\n"
+            "next_step_id: null\n"
+            "---\n"
+            "# Task Objective\nA test.\n\n"
+            "## Step History\n\n### Step 1 — create-branch\nDone.\n\n"
+            "## Cross-Step Decisions\n\n"
+            "## Next Step Notes\nAll done.\n"
+        )
+        write_text(path=_checkpoint_path(repo_root=tmp_path), content=content)
+        result: VerificationResult = _run()
+        assert "CK-W003" in _codes(result)

@@ -83,6 +83,8 @@ STATUS_SKIPPED: str = "skipped"
 STATUS_PENDING: str = "pending"
 STATUS_IN_PROGRESS: str = "in_progress"
 
+CHECKPOINT_SPEC_VERSION: str = "1"
+
 FILE_SIZE_LIMIT_BYTES: int = 10 * 1024  # 10 KB
 STEP_HISTORY_WORD_LIMIT: int = 100
 
@@ -300,6 +302,19 @@ def _check_frontmatter(
             )
         )
 
+    version: object = parsed.get(FRONTMATTER_FIELD_SPEC_VERSION)
+    if version is not None and str(version) != CHECKPOINT_SPEC_VERSION:
+        diagnostics.append(
+            Diagnostic(
+                code=CODE_CK_E002,
+                message=(
+                    f"spec_version {version!r} is not supported;"
+                    f" expected {CHECKPOINT_SPEC_VERSION!r}"
+                ),
+                file_path=file_path,
+            )
+        )
+
     return diagnostics, fm_result, parsed
 
 
@@ -310,19 +325,27 @@ def _check_task_id(
     file_path: Path,
 ) -> list[Diagnostic]:
     fm_task_id: object = frontmatter.get(FRONTMATTER_FIELD_TASK_ID)
-    if not isinstance(fm_task_id, str):
-        if fm_task_id is not None:
+    if fm_task_id is None:
+        if FRONTMATTER_FIELD_TASK_ID in frontmatter:
             return [
                 Diagnostic(
                     code=CODE_CK_E004,
-                    message=(
-                        f"task_id has wrong type:"
-                        f" expected str, got {type(fm_task_id).__name__}"
-                    ),
+                    message="task_id is null; expected a string matching the task folder name",
                     file_path=file_path,
                 )
             ]
-        return []
+        return []  # Missing — CK-E003 handles it
+    if not isinstance(fm_task_id, str):
+        return [
+            Diagnostic(
+                code=CODE_CK_E004,
+                message=(
+                    f"task_id has wrong type:"
+                    f" expected str, got {type(fm_task_id).__name__}"
+                ),
+                file_path=file_path,
+            )
+        ]
     if fm_task_id == task_id:
         return []
     return [
@@ -473,13 +496,12 @@ def _check_completed_steps_count(
     ]
 
 
-def _parse_step_history_heading(*, heading: str) -> tuple[int, str | None] | None:
-    """Return (step_number, step_id) from a heading like 'Step 3 — planning', or None."""
-    match: re.Match[str] | None = re.match(r"^Step\s+(\d+)(?:\s+—\s+(\S+))?", heading)
+def _parse_step_history_heading(*, heading: str) -> tuple[int, str] | None:
+    """Return (step_number, step_id) from 'Step 3 — planning', or None if malformed."""
+    match: re.Match[str] | None = re.match(r"^Step\s+(\d+)\s+—\s+(\S+)$", heading.strip())
     if match is None:
         return None
-    step_id: str | None = match.group(2)
-    return int(match.group(1)), step_id
+    return int(match.group(1)), match.group(2)
 
 
 def _check_step_history(
@@ -503,12 +525,10 @@ def _check_step_history(
         body=history_body,
         level=3,
     )
-    # Map step_number → step_id extracted from the heading (e.g. "Step 3 — planning")
-    documented: dict[int, str | None] = {}
+    # Map step_number → step_id from headings that match "Step N — step-id" exactly
+    documented: dict[int, str] = {}
     for entry in history_entries:
-        parsed: tuple[int, str | None] | None = _parse_step_history_heading(
-            heading=entry.heading
-        )
+        parsed: tuple[int, str] | None = _parse_step_history_heading(heading=entry.heading)
         if parsed is not None:
             documented[parsed[0]] = parsed[1]
 
@@ -529,7 +549,7 @@ def _check_step_history(
                     file_path=file_path,
                 )
             )
-        elif documented[step_num_obj] is not None and documented[step_num_obj] != str(step_name):
+        elif documented[step_num_obj] != str(step_name):
             diagnostics.append(
                 Diagnostic(
                     code=CODE_CK_E007,

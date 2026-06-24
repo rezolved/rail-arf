@@ -229,17 +229,19 @@ may be replaced with: `### Step N — <step-id>\nTrimmed to stay within 10 KB li
 
 ## Verificator
 
-`arf/scripts/verificators/verify_checkpoint.py` enforces this specification.
+`arf/scripts/verificators/verify_checkpoint.py` enforces the structural and consistency checks
+listed below. It does not validate prose quality, section ordering, or content beyond what is
+described in the table.
 
 | Code | Severity | Check |
 | --- | --- | --- |
 | `CK-E001` | error | `checkpoint.md` missing when task has ≥ 1 completed step |
-| `CK-E002` | error | YAML frontmatter missing or not parseable |
+| `CK-E002` | error | YAML frontmatter missing, not parseable, or `spec_version` value not supported |
 | `CK-E003` | error | Required frontmatter field missing (`spec_version`, `task_id`, `updated_at`, `completed_steps`, `next_step_number`, `next_step_id`) |
-| `CK-E004` | error | `task_id` does not match task folder name |
-| `CK-E005` | error | `next_step_number` does not match the next pending step in `step_tracker.json` |
-| `CK-E006` | error | `completed_steps` count does not match `step_tracker.json` (completed + skipped) |
-| `CK-E007` | error | Step History missing entry for a completed step |
+| `CK-E004` | error | `task_id` is null, wrong type, or does not match task folder name |
+| `CK-E005` | error | `next_step_number` or `next_step_id` does not match the next pending step in `step_tracker.json` |
+| `CK-E006` | error | `completed_steps` is null, wrong type, or count does not match `step_tracker.json` (completed + skipped) |
+| `CK-E007` | error | Step History missing or malformed entry (`### Step N — <step-id>` required) for a completed or skipped step |
 | `CK-W001` | warning | File size > 10 KB |
 | `CK-W002` | warning | A Step History entry exceeds ~100 words |
 | `CK-W003` | warning | `updated_at` is older than the latest completed step's `completed_at` in `step_tracker.json` |

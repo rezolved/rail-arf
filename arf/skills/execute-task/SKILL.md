@@ -17,7 +17,7 @@ Execute a complete task through all mandatory stages and finish with a merged PR
 
 * * *
 
-# Part A — Coordinator
+## Part A — Coordinator
 
 The coordinator is a thin orchestrator. It reads three files, spawns a fresh step-executor Agent for
 each pending step, and handles only Phase −1 (liveness) and Phases 7-9 (PR/merge/overview) inline.
@@ -244,7 +244,7 @@ Each step-executor reads only the specs listed here. No other spec files.
 
 * * *
 
-# Part B — Step-Executor
+## Part B — Step-Executor
 
 A step-executor is a fresh Agent spawned for exactly one step. Read only the files listed for your
 step in the Per-Step Spec Table and the `checkpoint.md` contents passed in your prompt. Do not load
