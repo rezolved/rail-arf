@@ -252,7 +252,7 @@ def run_poststep(*, task_id: str, step_id: str) -> int:
     # Pass --current-step-id so verify_checkpoint treats this step as completed even though
     # step_tracker.json still shows it as in_progress at this point.
     if step_order >= 2:
-        tracker_step_id: object = step.get("step_id")
+        tracker_step_id: object = step.get(FIELD_NAME)
         checkpoint_cmd: list[str] = ["uv", "run", "python", str(VERIFY_CHECKPOINT_SCRIPT), task_id]
         if isinstance(tracker_step_id, str):
             checkpoint_cmd += ["--current-step-id", tracker_step_id]

@@ -74,7 +74,7 @@ SECTION_NEXT_STEP_NOTES: str = "Next Step Notes"
 
 STEP_TRACKER_FIELD_STEPS: str = "steps"
 STEP_TRACKER_FIELD_STEP: str = "step"
-STEP_TRACKER_FIELD_STEP_ID: str = "step_id"
+STEP_TRACKER_FIELD_NAME: str = "name"
 STEP_TRACKER_FIELD_STATUS: str = "status"
 STEP_TRACKER_FIELD_COMPLETED_AT: str = "completed_at"
 
@@ -203,7 +203,7 @@ def _promote_in_progress_step(
     result: list[dict[str, Any]] = []
     for step in steps:
         if (
-            step.get(STEP_TRACKER_FIELD_STEP_ID) == step_id
+            step.get(STEP_TRACKER_FIELD_NAME) == step_id
             and step.get(STEP_TRACKER_FIELD_STATUS) == STATUS_IN_PROGRESS
         ):
             result.append({**step, STEP_TRACKER_FIELD_STATUS: STATUS_COMPLETED})
@@ -311,6 +311,17 @@ def _check_task_id(
 ) -> list[Diagnostic]:
     fm_task_id: object = frontmatter.get(FRONTMATTER_FIELD_TASK_ID)
     if not isinstance(fm_task_id, str):
+        if fm_task_id is not None:
+            return [
+                Diagnostic(
+                    code=CODE_CK_E004,
+                    message=(
+                        f"task_id has wrong type:"
+                        f" expected str, got {type(fm_task_id).__name__}"
+                    ),
+                    file_path=file_path,
+                )
+            ]
         return []
     if fm_task_id == task_id:
         return []
@@ -333,85 +344,89 @@ def _check_next_step_fields(
 ) -> list[Diagnostic]:
     fm_next_num: object = frontmatter.get(FRONTMATTER_FIELD_NEXT_STEP_NUMBER)
     fm_next_id: object = frontmatter.get(FRONTMATTER_FIELD_NEXT_STEP_ID)
+    next_num_present: bool = FRONTMATTER_FIELD_NEXT_STEP_NUMBER in frontmatter
+    next_id_present: bool = FRONTMATTER_FIELD_NEXT_STEP_ID in frontmatter
     next_pending: dict[str, Any] | None = _next_pending_step(steps=steps)
 
     diagnostics: list[Diagnostic] = []
 
-    # Validate next_step_number
-    if fm_next_num is None and next_pending is not None:
-        tracker_next: object = next_pending.get(STEP_TRACKER_FIELD_STEP)
-        diagnostics.append(
-            Diagnostic(
-                code=CODE_CK_E005,
-                message=f"next_step_number is null but step {tracker_next} is still pending",
-                file_path=file_path,
-            )
-        )
-    elif fm_next_num is not None and next_pending is None:
-        diagnostics.append(
-            Diagnostic(
-                code=CODE_CK_E005,
-                message=f"next_step_number is {fm_next_num!r} but no pending steps remain",
-                file_path=file_path,
-            )
-        )
-    elif fm_next_num is not None and next_pending is not None:
-        if not isinstance(fm_next_num, int):
+    # Validate next_step_number — skip when field is absent (CK-E003 already fires)
+    if next_num_present:
+        if fm_next_num is None and next_pending is not None:
+            tracker_next: object = next_pending.get(STEP_TRACKER_FIELD_STEP)
             diagnostics.append(
                 Diagnostic(
                     code=CODE_CK_E005,
-                    message=(
-                        f"next_step_number has wrong type:"
-                        f" expected int, got {type(fm_next_num).__name__}"
-                    ),
+                    message=f"next_step_number is null but step {tracker_next} is still pending",
                     file_path=file_path,
                 )
             )
-        else:
-            tracker_next_num: object = next_pending.get(STEP_TRACKER_FIELD_STEP)
-            if isinstance(tracker_next_num, int) and fm_next_num != tracker_next_num:
+        elif fm_next_num is not None and next_pending is None:
+            diagnostics.append(
+                Diagnostic(
+                    code=CODE_CK_E005,
+                    message=f"next_step_number is {fm_next_num!r} but no pending steps remain",
+                    file_path=file_path,
+                )
+            )
+        elif fm_next_num is not None and next_pending is not None:
+            if not isinstance(fm_next_num, int):
                 diagnostics.append(
                     Diagnostic(
                         code=CODE_CK_E005,
                         message=(
-                            f"next_step_number {fm_next_num} does not match"
-                            f" step_tracker.json next pending step {tracker_next_num}"
+                            f"next_step_number has wrong type:"
+                            f" expected int, got {type(fm_next_num).__name__}"
                         ),
                         file_path=file_path,
                     )
                 )
+            else:
+                tracker_next_num: object = next_pending.get(STEP_TRACKER_FIELD_STEP)
+                if isinstance(tracker_next_num, int) and fm_next_num != tracker_next_num:
+                    diagnostics.append(
+                        Diagnostic(
+                            code=CODE_CK_E005,
+                            message=(
+                                f"next_step_number {fm_next_num} does not match"
+                                f" step_tracker.json next pending step {tracker_next_num}"
+                            ),
+                            file_path=file_path,
+                        )
+                    )
 
-    # Validate next_step_id
-    if fm_next_id is None and next_pending is not None:
-        tracker_next_id: object = next_pending.get(STEP_TRACKER_FIELD_STEP_ID)
-        diagnostics.append(
-            Diagnostic(
-                code=CODE_CK_E005,
-                message=f"next_step_id is null but step '{tracker_next_id}' is still pending",
-                file_path=file_path,
-            )
-        )
-    elif fm_next_id is not None and next_pending is None:
-        diagnostics.append(
-            Diagnostic(
-                code=CODE_CK_E005,
-                message=f"next_step_id is {fm_next_id!r} but no pending steps remain",
-                file_path=file_path,
-            )
-        )
-    elif fm_next_id is not None and next_pending is not None:
-        tracker_next_id_str: object = next_pending.get(STEP_TRACKER_FIELD_STEP_ID)
-        if fm_next_id != tracker_next_id_str:
+    # Validate next_step_id — skip when field is absent (CK-E003 already fires)
+    if next_id_present:
+        if fm_next_id is None and next_pending is not None:
+            tracker_next_id: object = next_pending.get(STEP_TRACKER_FIELD_NAME)
             diagnostics.append(
                 Diagnostic(
                     code=CODE_CK_E005,
-                    message=(
-                        f"next_step_id {fm_next_id!r} does not match"
-                        f" step_tracker.json next pending step_id {tracker_next_id_str!r}"
-                    ),
+                    message=f"next_step_id is null but step '{tracker_next_id}' is still pending",
                     file_path=file_path,
                 )
             )
+        elif fm_next_id is not None and next_pending is None:
+            diagnostics.append(
+                Diagnostic(
+                    code=CODE_CK_E005,
+                    message=f"next_step_id is {fm_next_id!r} but no pending steps remain",
+                    file_path=file_path,
+                )
+            )
+        elif fm_next_id is not None and next_pending is not None:
+            tracker_next_id_str: object = next_pending.get(STEP_TRACKER_FIELD_NAME)
+            if fm_next_id != tracker_next_id_str:
+                diagnostics.append(
+                    Diagnostic(
+                        code=CODE_CK_E005,
+                        message=(
+                            f"next_step_id {fm_next_id!r} does not match"
+                            f" step_tracker.json next pending step name {tracker_next_id_str!r}"
+                        ),
+                        file_path=file_path,
+                    )
+                )
 
     return diagnostics
 
@@ -424,6 +439,14 @@ def _check_completed_steps_count(
 ) -> list[Diagnostic]:
     fm_count: object = frontmatter.get(FRONTMATTER_FIELD_COMPLETED_STEPS)
     if fm_count is None:
+        if FRONTMATTER_FIELD_COMPLETED_STEPS in frontmatter:
+            return [
+                Diagnostic(
+                    code=CODE_CK_E006,
+                    message="completed_steps is null; expected an integer",
+                    file_path=file_path,
+                )
+            ]
         return []
     if not isinstance(fm_count, int):
         return [
@@ -450,11 +473,13 @@ def _check_completed_steps_count(
     ]
 
 
-def _parse_step_history_heading(*, heading: str) -> int | None:
-    match: re.Match[str] | None = re.match(r"^Step\s+(\d+)", heading)
+def _parse_step_history_heading(*, heading: str) -> tuple[int, str | None] | None:
+    """Return (step_number, step_id) from a heading like 'Step 3 — planning', or None."""
+    match: re.Match[str] | None = re.match(r"^Step\s+(\d+)(?:\s+—\s+(\S+))?", heading)
     if match is None:
         return None
-    return int(match.group(1))
+    step_id: str | None = match.group(2)
+    return int(match.group(1)), step_id
 
 
 def _check_step_history(
@@ -478,25 +503,40 @@ def _check_step_history(
         body=history_body,
         level=3,
     )
-    documented_numbers: set[int] = set()
+    # Map step_number → step_id extracted from the heading (e.g. "Step 3 — planning")
+    documented: dict[int, str | None] = {}
     for entry in history_entries:
-        step_num: int | None = _parse_step_history_heading(heading=entry.heading)
-        if step_num is not None:
-            documented_numbers.add(step_num)
+        parsed: tuple[int, str | None] | None = _parse_step_history_heading(
+            heading=entry.heading
+        )
+        if parsed is not None:
+            documented[parsed[0]] = parsed[1]
 
     diagnostics: list[Diagnostic] = []
     for step in completed:
         step_num_obj: object = step.get(STEP_TRACKER_FIELD_STEP)
         if not isinstance(step_num_obj, int):
             continue
-        if step_num_obj not in documented_numbers:
-            step_id: object = step.get(STEP_TRACKER_FIELD_STEP_ID, "unknown")
+        step_name: object = step.get(STEP_TRACKER_FIELD_NAME, "unknown")
+        if step_num_obj not in documented:
             diagnostics.append(
                 Diagnostic(
                     code=CODE_CK_E007,
                     message=(
                         f"Step History missing entry for completed or skipped step"
-                        f" {step_num_obj} ({step_id})"
+                        f" {step_num_obj} ({step_name})"
+                    ),
+                    file_path=file_path,
+                )
+            )
+        elif documented[step_num_obj] is not None and documented[step_num_obj] != str(step_name):
+            diagnostics.append(
+                Diagnostic(
+                    code=CODE_CK_E007,
+                    message=(
+                        f"Step History entry for step {step_num_obj} has step_id"
+                        f" {documented[step_num_obj]!r} but step_tracker.json"
+                        f" name is {step_name!r}"
                     ),
                     file_path=file_path,
                 )

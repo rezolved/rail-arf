@@ -45,8 +45,7 @@ Step 1 completed successfully. Proceed to step 2 (research-papers) per step_trac
 
 _STEP_COMPLETED: dict[str, object] = {
     "step": 1,
-    "step_id": "create-branch",
-    "name": "Create Branch",
+    "name": "create-branch",
     "status": "completed",
     "completed_at": "2026-06-23T13:55:00Z",
     "started_at": "2026-06-23T13:54:00Z",
@@ -57,8 +56,7 @@ _STEP_COMPLETED: dict[str, object] = {
 
 _STEP_PENDING: dict[str, object] = {
     "step": 2,
-    "step_id": "research-papers",
-    "name": "Research Papers",
+    "name": "research-papers",
     "status": "pending",
 }
 
@@ -274,8 +272,7 @@ class TestCkE007MissingStepHistory:
         build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
         step_2_completed: dict[str, object] = {
             "step": 2,
-            "step_id": "research-papers",
-            "name": "Research Papers",
+            "name": "research-papers",
             "status": "completed",
             "completed_at": "2026-06-23T15:00:00Z",
             "started_at": "2026-06-23T14:30:00Z",
@@ -322,8 +319,7 @@ class TestCurrentStepIdPromotion:
         build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
         step_2_in_progress: dict[str, object] = {
             "step": 2,
-            "step_id": "research-papers",
-            "name": "Research Papers",
+            "name": "research-papers",
             "status": "in_progress",
             "started_at": "2026-06-23T14:30:00Z",
             "last_heartbeat_at": "2026-06-23T14:45:00Z",
@@ -332,8 +328,7 @@ class TestCurrentStepIdPromotion:
         }
         step_3_pending: dict[str, object] = {
             "step": 3,
-            "step_id": "planning",
-            "name": "Planning",
+            "name": "planning",
             "status": "pending",
         }
         build_step_tracker(
