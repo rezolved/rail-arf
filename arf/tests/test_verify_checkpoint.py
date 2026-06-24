@@ -635,3 +635,78 @@ class TestCkW003UpdatedAtStaleness:
         write_text(path=_checkpoint_path(repo_root=tmp_path), content=content)
         result: VerificationResult = _run()
         assert "CK-W003" in _codes(result)
+
+
+class TestCkE003UpdatedAtTypeValidation:
+    def _base_content(self, *, updated_at_yaml: str) -> str:
+        return (
+            "---\n"
+            'spec_version: "1"\n'
+            f'task_id: "{TASK_ID}"\n'
+            f"{updated_at_yaml}\n"
+            "completed_steps: 1\n"
+            "next_step_number: null\n"
+            "next_step_id: null\n"
+            "---\n"
+            "# Task Objective\nA test.\n\n"
+            "## Step History\n\n### Step 1 — create-branch\nDone.\n\n"
+            "## Cross-Step Decisions\n\n"
+            "## Next Step Notes\nAll done.\n"
+        )
+
+    def test_null_updated_at_fires(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[{**_STEP_COMPLETED, "completed_at": "2026-06-23T14:00:00Z"}],
+        )
+        write_text(
+            path=_checkpoint_path(repo_root=tmp_path),
+            content=self._base_content(updated_at_yaml="updated_at: null"),
+        )
+        result: VerificationResult = _run()
+        assert "CK-E003" in _codes(result)
+
+    def test_wrong_type_updated_at_fires(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[{**_STEP_COMPLETED, "completed_at": "2026-06-23T14:00:00Z"}],
+        )
+        write_text(
+            path=_checkpoint_path(repo_root=tmp_path),
+            content=self._base_content(updated_at_yaml="updated_at: 20260623"),
+        )
+        result: VerificationResult = _run()
+        assert "CK-E003" in _codes(result)
+
+    def test_invalid_iso8601_updated_at_fires(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+        build_task_folder(repo_root=tmp_path, task_id=TASK_ID)
+        build_step_tracker(
+            repo_root=tmp_path,
+            task_id=TASK_ID,
+            steps=[{**_STEP_COMPLETED, "completed_at": "2026-06-23T14:00:00Z"}],
+        )
+        write_text(
+            path=_checkpoint_path(repo_root=tmp_path),
+            content=self._base_content(updated_at_yaml='updated_at: "not-a-date"'),
+        )
+        result: VerificationResult = _run()
+        assert "CK-E003" in _codes(result)

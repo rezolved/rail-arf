@@ -625,12 +625,37 @@ def _check_updated_at(
     file_path: Path,
 ) -> list[Diagnostic]:
     updated_at_raw: object = frontmatter.get(FRONTMATTER_FIELD_UPDATED_AT)
+    if updated_at_raw is None:
+        if FRONTMATTER_FIELD_UPDATED_AT in frontmatter:
+            return [
+                Diagnostic(
+                    code=CODE_CK_E003,
+                    message="updated_at is null; expected an ISO 8601 UTC timestamp string",
+                    file_path=file_path,
+                )
+            ]
+        return []  # Missing — CK-E003 handles it from _check_required_fields
     if not isinstance(updated_at_raw, str):
-        return []
+        return [
+            Diagnostic(
+                code=CODE_CK_E003,
+                message=(
+                    f"updated_at has wrong type: expected str,"
+                    f" got {type(updated_at_raw).__name__}"
+                ),
+                file_path=file_path,
+            )
+        ]
     try:
         updated_at: datetime = _parse_iso8601(value=updated_at_raw)
     except ValueError:
-        return []
+        return [
+            Diagnostic(
+                code=CODE_CK_E003,
+                message=f"updated_at is not a valid ISO 8601 UTC timestamp: {updated_at_raw!r}",
+                file_path=file_path,
+            )
+        ]
 
     completed: list[dict[str, Any]] = _completed_steps(steps=steps)
     latest: datetime | None = _latest_completed_at(completed=completed)
