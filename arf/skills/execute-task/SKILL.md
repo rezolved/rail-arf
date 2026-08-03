@@ -4,7 +4,7 @@ description: "Run an ARF task through all required stages and merge the final PR
 ---
 # Execute Task
 
-**Version**: 25
+**Version**: 29
 
 ## Goal
 
@@ -22,9 +22,9 @@ Execute a complete task through all mandatory stages and finish with a merged PR
 The coordinator is a thin orchestrator. It reads three files, spawns a fresh step-executor Agent for
 each pending step, and handles only Phase −1 (liveness) and Phases 7-9 (PR/merge/overview) inline.
 
-## Coordinator Context
+## Context
 
-Read before starting **and at every wakeup**:
+The coordinator reads these and nothing else, before starting **and at every wakeup**:
 
 * `tasks/$TASK_ID/task.json` — task objective and dependencies
 * `tasks/$TASK_ID/step_tracker.json` — current step state (may not exist on first run)
@@ -47,7 +47,7 @@ handoff. It must execute before any other phase.
 
    Exit code `0` means no stuck step was detected — proceed to Phase 0.
 
-2. If the verificator returns non-zero, a step needs recovery before any new work. Two error codes
+2. If the verificator returns non-zero, a step needs recovery before any new work. Four error codes
    can appear:
 
    * `ST-E007` — an `in_progress` step has a stale heartbeat AND a live VM is still provisioned: the
@@ -55,6 +55,14 @@ handoff. It must execute before any other phase.
    * `ST-E008` — a `paused_waiting` step has `watchdog_active != true`: an unsafe pause. Either
      confirm/install the idle watchdog and set `watchdog_active`, or drive the step synchronously /
      transition it to `blocked_intervention`. Never leave a step paused without a watchdog.
+   * `ST-E009` — an `in_progress` step is missing `last_heartbeat_at`, `heartbeat_interval_seconds`,
+     or `expected_completion_at`. The step cannot be monitored at all: no staleness check can fire
+     for it. Adopt it via `arf.scripts.utils.heartbeat.start_step` (which writes all three) and
+     drive it inline, or transition it to a terminal state.
+   * `ST-E010` — a `paused_waiting` step has re-paused more than the cap (default 12). The wait is
+     not converging: the step keeps going back to sleep waiting for something that is not coming.
+     Run `resume_check` (step 5), then drive it to a terminal state or transition it to
+     `blocked_intervention`. Never simply pause it again.
 
    Do not continue with Phase 0. Instead:
 
@@ -75,6 +83,10 @@ handoff. It must execute before any other phase.
    a step is ghosted or pathologically slow. Run `/diagnose-stuck-step` inline as above, then act on
    the report. The cost pressure is lower but the coordinator still owns the recovery.
 
+   `ST-W008` means a live machine is running without an idle watchdog, so nothing on the machine
+   side can stop it if this session goes away. Install the watchdog before continuing — see
+   `/setup-remote-machine` Phase 3 — and record `watchdog_active` in `machine_log.json`.
+
 4. After acting on every flagged step, re-run `verify_step_liveness --all`. Only when it returns `0`
    may the coordinator proceed to Phase 0.
 
@@ -85,18 +97,79 @@ handoff. It must execute before any other phase.
    * If `now < resume_after`: the wait is not over. Register one `ScheduleWakeup` for the earliest
      `resume_after` across all paused steps and STOP this invocation — do not start Phase 0 work.
      The VM's idle watchdog protects spend in the meantime.
-   * If `now >= resume_after`: re-dispatch the step's skill (e.g. `/implementation`) in resume mode
-     — spawn its subagent, passing the step's `resume_sentinel` and instructions to re-check it. The
-     skill then either drives the step to a terminal state or calls `pause_step` again with a new
-     `resume_after`.
+
+   * If `now >= resume_after`: first ask whether the remote work is even still alive:
+
+     ```bash
+     uv run python -m arf.scripts.utils.resume_check <task_id> <step_number>
+     ```
+
+     * `job_dead` (exit `3`) — do **NOT** re-dispatch the skill in resume mode; a resume would just
+       pause again on a job that no longer exists. Drive the recovery inline: collect the job log
+       from the VM, tear the machine down per `/setup-remote-machine`, and transition the step to
+       `failed` or `blocked_intervention` with an intervention file naming the probe and its exit
+       code.
+     * `job_alive` or `no_probe` — re-dispatch the step's skill (e.g. `/implementation`) in resume
+       mode: spawn its subagent, passing the step's `resume_sentinel` and instructions to re-check
+       it. The skill then either drives the step to a terminal state or calls `pause_step` again
+       with a new `resume_after`.
 
    Only when no `paused_waiting` step remains pending resume may the coordinator proceed to Phase 0.
 
+   A pause must be able to end in failure. The watchdog bounds what a dead job costs, not how long
+   it goes unnoticed: without this check a training run killed overnight is re-paused every wakeup,
+   and the task reads as "waiting" until a human reads a log.
+
 Critical rule: NEVER re-delegate **recovery** (ghosted/emergency steps from steps 2-3) to a fresh
 subagent — drive it inline (the failure mode behind the 9-hour idle incident, `LESSONS.md` Lesson
-9). This is distinct from the sanctioned **resume** path in step 5: a `paused_waiting` step on a
+8). This is distinct from the sanctioned **resume** path in step 5: a `paused_waiting` step on a
 watchdog-protected VM may legitimately end the session and resume on a scheduled wakeup, because the
 watchdog — not the coordinator — is what guarantees the VM cannot run away.
+
+## Phase −0.5: Exit discipline
+
+This phase has no steps to run. It is the rule that governs how every invocation of this skill is
+allowed to end, and it applies at the end of every turn, not only at the end of the skill.
+
+**NEVER end an invocation while any step is `in_progress` unless a `ScheduleWakeup` is registered
+for it.** Before yielding, re-read `step_tracker.json`. For each `in_progress` step, exactly one of
+these must be true:
+
+* The step reached a terminal state (`completed`, `failed`, `skipped`, `blocked_intervention`).
+* The step is now `paused_waiting` with `watchdog_active: true` and a `ScheduleWakeup` registered
+  for its `resume_after`.
+* A `ScheduleWakeup` is registered to re-enter this skill and continue driving the step.
+
+The `Stop` hook (`arf/scripts/hooks/verify_logs_on_stop.py`) blocks the **first** attempt to end a
+turn while a live task holds an `in_progress` step, and returns the two legal exits to you. It is
+one forced reminder per turn, not a guarantee: `stop_hook_active` short-circuits the check on the
+repeat stop, so an agent that changed nothing can still leave — honouring that flag is what keeps a
+turn from becoming unstoppable. Treat the block as the rule speaking rather than an obstacle to
+route around: either finish the step or hand it over with `heartbeat pause` plus a registered
+wakeup. The hook also cannot see whether the wakeup exists; a pause with no wakeup passes it and
+reproduces the original bug.
+
+The check is repo-wide, so a step named in the block may belong to another session. Never drive a
+step this session does not own — say so and stop again.
+
+Nothing polls a task on its own. This skill runs only when an event wakes it: a harness-tracked
+background task exits, a `ScheduleWakeup` fires, or a human types. Work on a remote machine — a
+`tmux` session over SSH, a detached training job, a `nohup`'d script — emits none of those events,
+and neither does a background shell that never exits, such as a `tail -f` or a poll loop. Ending a
+turn on the expectation of "the next notification" registers nothing and delivers nothing: the step
+stays `in_progress`, unattended, with the VM billing, until a human notices.
+
+Forbidden phrasings that signal this bug — if about to write any of these, register a
+`ScheduleWakeup` instead:
+
+* "I'll wait for the next notification."
+* "Continuing to monitor in the background."
+* "The background poller will pick this up."
+
+When the wait is long (a multi-hour training run), prefer the sanctioned release path: transition
+the step to `paused_waiting` on a watchdog-protected VM via
+`arf.scripts.utils.heartbeat.pause_step`, then register the `ScheduleWakeup` for `resume_after`.
+Choose the wakeup delay from the work being waited on, not from a fixed habit.
 
 ## Coordinator Loop
 
@@ -255,8 +328,22 @@ other spec files, plan files from other tasks, or research files outside your st
 Every step follows this exact sequence:
 
 1. `uv run python -m arf.scripts.utils.prestep $TASK_ID $STEP_ID`
+
+   This arms liveness: it writes `current_owner`, `last_heartbeat_at`, `heartbeat_interval_seconds`,
+   and `expected_completion_at`, so the step is monitorable from the moment it starts. For a step
+   expected to run long, pass realistic values instead of inheriting the safety-net defaults (1800 s
+   cadence, 1 h expected):
+
+   ```bash
+   uv run python -m arf.scripts.utils.prestep $TASK_ID $STEP_ID \
+     --heartbeat-interval-seconds 300 --expected-duration-seconds 14400
+   ```
+
 2. Do the step work (see your step's phase below). For skill invocations, spawn a subagent per Rule
-   9\.
+   9\. Whenever the work runs longer than the declared cadence, refresh the heartbeat:
+   `uv run python -m arf.scripts.utils.heartbeat write $TASK_ID $STEP_NUMBER step-executor/$STEP_ID`.
+   A step that stops beating is treated as dead — from the outside it is indistinguishable from one.
+
 3. *(step_order ≥ 2 only)* Update `tasks/$TASK_ID/checkpoint.md`: a. Append
    `### Step $STEP_NUMBER — $STEP_ID` to `## Step History` (max 3 sentences: decision made, key
    output file, any caveat for downstream). b. Add downstream-impacting decisions to
@@ -266,11 +353,18 @@ Every step follows this exact sequence:
    (count of completed+skipped steps after this step), `next_step_number`, `next_step_id` (from
    `step_tracker.json`; use `null` when this is the last step). e.
    `uv run flowmark --inplace --nobackup tasks/$TASK_ID/checkpoint.md`
+
 4. `uv run flowmark --inplace --nobackup` on all `.md` files created or modified in this step.
    `uv run ruff check --fix . && uv run ruff format .` on any `.py` files.
+
 5. Stage all step work files **including `checkpoint.md`** (step_order ≥ 2) and `step_tracker.json`.
+
 6. Commit: `$TASK_ID [$STEP_ID]: <description>`
-7. `uv run python -m arf.scripts.utils.poststep $TASK_ID $STEP_ID`
+
+7. `uv run python -m arf.scripts.utils.poststep $TASK_ID $STEP_ID` — this also finalizes liveness:
+   it clears `current_owner` and writes `actual_duration_seconds`, releasing the step that prestep
+   armed in step 1.
+
 8. Return `{"status": "completed", "notes": "<one sentence>"}`.
 
 *(Step 1 `create-branch` is exempt from protocol step 3. The coordinator creates `checkpoint.md`
@@ -286,7 +380,8 @@ after `create-branch` completes — see Part A.)*
 2. Step numbers are sequential (1, 2, 3, ...) with no gaps, regardless of which canonical steps are
    skipped.
 
-3. Every step follows the prestep/do/poststep cycle — no exceptions.
+3. Every step follows the prestep/do/poststep cycle — the one exception is a skipped step, which
+   goes through `skip_step` instead (it finalizes liveness the same way poststep does).
 
 4. Every CLI command on a task branch must be wrapped with `run_with_logs.py`.
 
@@ -1428,6 +1523,10 @@ After `verify_task_complete.py` passes, refresh the generated overview from the 
   auto-commits the completion update
 
 * NEVER modify infrastructure files (arf/, .claude/, specs) on a task branch
+
+* NEVER end an invocation with a step left `in_progress` and no `ScheduleWakeup` registered — see
+  Phase −0.5. Waiting for a notification that no component will send is the fire-and-forget pattern
+  banned by `LESSONS.md` Lesson 8
 
 * NEVER override or restrict a skill's behavior when spawning its subagent
 

@@ -4,7 +4,7 @@ description: "Execute `plan/plan.md`, produce assets, and verify results."
 ---
 # Implementation
 
-**Version**: 12
+**Version**: 13
 
 ## Goal
 
@@ -71,19 +71,41 @@ Read before starting:
 9. **Liveness contract.** While a step is `in_progress`, keep `step_tracker.json` heart-beating via
    `arf.scripts.utils.heartbeat.write_heartbeat` at the `heartbeat_interval_seconds` cadence. When
    the implementation must wait (engine load, long benchmark, multi-hour training), choose one of:
+
    * **(a) drive the wait synchronously** and continue beating;
+
    * **(b) transition to `blocked_intervention`** with a written intervention file; or
+
    * **(c) pause and resume from files** — call `arf.scripts.utils.heartbeat.pause_step` (CLI:
-     `heartbeat pause <task_id> <step> --resume-sentinel "<what to re-check, e.g. ~/VLLM_READY_AT on vast 12345>" --resume-after <ISO> --watchdog-active`),
+     `heartbeat pause <task_id> <step> --resume-sentinel "<what to re-check, e.g. ~/VLLM_READY_AT on vast 12345>" --resume-after <ISO> --watchdog-active --liveness-probe "<cmd that exits 0 while the job runs>"`),
      then return control. This sets the step to `paused_waiting` and clears the owner;
-     `execute-task` Phase −1 re-dispatches `/implementation` once `resume_after` passes, and you
-     re-check the sentinel and either finish or pause again. Option (c) avoids holding a warm
-     context idle across a long GPU wait, but is permitted **ONLY when the VM carries the idle
-     dead-man's-switch watchdog** (setup-remote-machine `--enable-idle-watchdog` for vast;
-     service-account self-stop for nebius; Azure IdleShutdown) — `pause_step` refuses without
-     `watchdog_active`, and `verify_step_liveness` flags an unprotected pause as `ST-E008`. That
-     watchdog is the money safety net that makes ending the session safe: a missed wakeup cannot
-     leave the box billing.
+     `execute-task` Phase −1 re-dispatches `/implementation` once `resume_after` passes. Option (c)
+     avoids holding a warm context idle across a long GPU wait, but is permitted **ONLY when the VM
+     carries the idle dead-man's-switch watchdog** (setup-remote-machine `--enable-idle-watchdog`
+     for vast; service-account self-stop for nebius; Azure IdleShutdown) — `pause_step` refuses
+     without `watchdog_active`, and `verify_step_liveness` flags an unprotected pause as `ST-E008`.
+     That watchdog is the money safety net that makes ending the session safe: a missed wakeup
+     cannot leave the box billing.
+
+     Always pass `--liveness-probe`. It is a shell command that exits `0` while the remote work is
+     still running — `ssh FT-NC80-v3 "tmux has-session -t train"` is the usual one. Without it, a
+     job that died at 03:00 is indistinguishable from one still training, and the step re-pauses
+     forever while nobody is told the run is dead. `verify_step_liveness` flags a probe-less pause
+     as `ST-W009`, and `ST-E010` once the step has re-paused more than 12 times.
+
+   **On resume, decide in three branches, not two.** Run
+   `uv run python -m arf.scripts.utils.resume_check <task_id> <step_number>` first and read its
+   `decision`:
+
+   * `sentinel present` (you check this yourself, per the step's `resume_sentinel`) — the work
+     finished. Drive the step to a terminal state.
+   * `job_alive` — still running. Pause again with a new `resume_after`.
+   * `job_dead` — the work died. Do **NOT** pause again. Collect the job's log from the VM,
+     transition the step to `failed` or `blocked_intervention`, and write an
+     `intervention/<n>_<reason>.md` naming the probe, its exit code, and where the log is. A dead
+     job re-paused is a task that hangs silently until a human notices.
+   * `no_probe` — the pause recorded no probe (a pre-v6 pause). Fall back to checking the sentinel
+     by hand, and pass `--liveness-probe` when you pause again.
 
    A blind background poller that leaves the step `in_progress` with no watchdog is still forbidden
    — that is the fire-and-forget pattern that produced the 9-hour idle billing incident in
@@ -135,8 +157,8 @@ Read before starting:
    * `tasks/$TASK_ID/research/research_summary.md` — compact synthesis of all research findings
 
    If you need more detail on a specific topic, read the relevant section of the full research files
-   (`research_papers.md`, `research_internet.md`, `research_code.md`) — but do not load them in
-   full unless necessary.
+   (`research_papers.md`, `research_internet.md`, `research_code.md`) — but do not load them in full
+   unless necessary.
 
 7. Scan all existing answer assets in question-only short form:
 

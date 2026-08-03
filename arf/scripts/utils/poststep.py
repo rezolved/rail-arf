@@ -23,10 +23,10 @@ import argparse
 import json
 import subprocess
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from arf.scripts.utils.heartbeat import finalize_step_liveness, now_iso8601_utc
 from arf.scripts.verificators.common.paths import (
     step_tracker_path,
 )
@@ -147,6 +147,20 @@ def _warn(message: str) -> None:
     print(f"POSTSTEP WARNING: {message}")
 
 
+def _report_command_failure(
+    *,
+    message: str,
+    result: subprocess.CompletedProcess[str],
+) -> None:
+    # Both streams go to stderr: a header on stderr with its detail on stdout interleaves
+    # unpredictably in a captured log, which is where these failures are read.
+    _error(message)
+    if len(result.stdout) > 0:
+        print(result.stdout, file=sys.stderr)
+    if len(result.stderr) > 0:
+        print(result.stderr, file=sys.stderr)
+
+
 def _warn_missing_skipped_step_logs(
     *,
     task_id: str,
@@ -239,11 +253,7 @@ def run_poststep(*, task_id: str, step_id: str) -> int:
         cwd=repo_root,
     )
     if verify_result.returncode != 0:
-        _error("Step verification failed:")
-        if len(verify_result.stdout) > 0:
-            print(verify_result.stdout)
-        if len(verify_result.stderr) > 0:
-            print(verify_result.stderr, file=sys.stderr)
+        _report_command_failure(message="Step verification failed:", result=verify_result)
         return 1
     _info("Step verification passed")
 
@@ -263,11 +273,10 @@ def run_poststep(*, task_id: str, step_id: str) -> int:
             cwd=repo_root,
         )
         if checkpoint_result.returncode != 0:
-            _error("Checkpoint verification failed:")
-            if len(checkpoint_result.stdout) > 0:
-                print(checkpoint_result.stdout)
-            if len(checkpoint_result.stderr) > 0:
-                print(checkpoint_result.stderr, file=sys.stderr)
+            _report_command_failure(
+                message="Checkpoint verification failed:",
+                result=checkpoint_result,
+            )
             return 1
         _info("Checkpoint verification passed")
 
@@ -284,9 +293,12 @@ def run_poststep(*, task_id: str, step_id: str) -> int:
     # --- All checks passed ---
 
     # Mark step as completed
-    now: str = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now: str = now_iso8601_utc()
     step[FIELD_STATUS] = STATUS_COMPLETED
     step[FIELD_COMPLETED_AT] = now
+    # Release the step: no live owner, and a measured duration rather than a field
+    # left null forever.
+    finalize_step_liveness(step=step, completed_at=now)
     _save_tracker(task_id=task_id, data=tracker)
     _info(f"Step '{step_id}' is now completed (completed_at: {now})")
 
@@ -294,15 +306,44 @@ def run_poststep(*, task_id: str, step_id: str) -> int:
     tracker_file: str = str(
         step_tracker_path(task_id=task_id).relative_to(repo_root),
     )
-    subprocess.run(
+    # This is the commit that persists the liveness fields finalize_step_liveness just
+    # wrote. Reporting success without checking it leaves the next step facing a dirty
+    # tree and an error message pointing away from the cause.
+    add_result: subprocess.CompletedProcess[str] = subprocess.run(
         ["git", "add", tracker_file],
+        capture_output=True,
+        text=True,
         cwd=repo_root,
     )
+    if add_result.returncode != 0:
+        _report_command_failure(
+            message=(
+                f"Failed to stage {tracker_file}. The step is ALREADY marked completed in "
+                f"step_tracker.json — fix the git error and commit {tracker_file} by hand. "
+                f"Do NOT re-run poststep: it will refuse a step that is no longer in_progress."
+            ),
+            result=add_result,
+        )
+        return 1
+
     commit_msg: str = f"{task_id} [{step_id}]: Mark step completed"
-    subprocess.run(
+    commit_result: subprocess.CompletedProcess[str] = subprocess.run(
         ["git", "commit", "-m", commit_msg],
+        capture_output=True,
+        text=True,
         cwd=repo_root,
     )
+    if commit_result.returncode != 0:
+        _report_command_failure(
+            message=(
+                f"Failed to commit the step_tracker.json update. The step is ALREADY marked "
+                f"completed in step_tracker.json — fix the git error and commit {tracker_file} "
+                f"by hand. Do NOT re-run poststep: it will refuse a step that is no longer "
+                f"in_progress."
+            ),
+            result=commit_result,
+        )
+        return 1
     _info("Committed step_tracker.json update")
 
     return 0

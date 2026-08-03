@@ -364,6 +364,47 @@ def test_unskipped_steps_remain_not_started(
             assert s["status"] == "not_started", f"step {s['name']} should remain not_started"
 
 
+def test_skip_finalizes_liveness_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Per step_tracker_specification.md v5 "Who writes the liveness fields":
+    # skip_step finalizes on reaching a terminal state — no live owner, and a
+    # duration only when one was actually measurable. This step is skipped from
+    # `pending`, so it never ran: the honest duration is null, not zero. A zero
+    # would read as "ran and took no time" to every downstream consumer.
+    task_dir: Path = _setup(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+    )
+
+    skip_step_module.skip_steps(
+        task_id=TASK_ID,
+        requests=[
+            skip_step_module.SkipRequest(
+                step_id="research-papers",
+                reason="No relevant papers in corpus.",
+            ),
+        ],
+    )
+
+    tracker: dict[str, object] = json.loads(
+        (task_dir / "step_tracker.json").read_text(encoding="utf-8"),
+    )
+    steps: list[dict[str, object]] = tracker["steps"]  # type: ignore[assignment]
+    skipped_step: dict[str, object] | None = None
+    for s in steps:
+        if s.get("name") == "research-papers":
+            skipped_step = s
+            break
+
+    assert skipped_step is not None
+    assert skipped_step["current_owner"] is None, "a terminal step has no live owner"
+    assert skipped_step["actual_duration_seconds"] is None, (
+        "a step skipped without ever starting has no measurable duration"
+    )
+
+
 def test_reskip_is_idempotent_noop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

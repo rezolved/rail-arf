@@ -83,7 +83,7 @@ def _full_azure_machine_log_entry(
     **overrides: object,
 ) -> dict[str, object]:
     entry: dict[str, object] = {
-        "spec_version": "5",
+        "spec_version": "6",
         "provider": "azure_ml",
         "instance_id": AZURE_VM_NAME,
         "vm_name": AZURE_VM_NAME,
@@ -1133,7 +1133,7 @@ def test_rm_e007_unknown_provider(
 
 
 # ---------------------------------------------------------------------------
-# RM-W007: spec_version missing or not "5"
+# RM-W007: spec_version missing or not "6"
 # ---------------------------------------------------------------------------
 
 
@@ -1238,7 +1238,7 @@ def test_new_vast_ai_slug_accepted(
         repo_root=tmp_path,
         task_id=TASK_ID,
         entries=[
-            _full_machine_log_entry(spec_version="5", provider="vast_ai"),
+            _full_machine_log_entry(spec_version="6", provider="vast_ai"),
         ],
     )
     result: VerificationResult = _verify()
@@ -1254,7 +1254,7 @@ def _full_nebius_machine_log_entry(
     **overrides: object,
 ) -> dict[str, object]:
     entry: dict[str, object] = {
-        "spec_version": "5",
+        "spec_version": "6",
         "provider": "nebius",
         "instance_id": NEBIUS_INSTANCE_ID,
         "platform": "gpu-h200-sxm",

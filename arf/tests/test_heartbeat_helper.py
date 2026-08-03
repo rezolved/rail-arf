@@ -19,6 +19,7 @@ import pytest
 import arf.scripts.verificators.verify_step as verify_step_module
 from arf.scripts.utils.heartbeat import (
     complete_step,
+    main,
     pause_step,
     start_step,
     write_heartbeat,
@@ -309,8 +310,32 @@ RESUME_SENTINEL_FIELD: str = "resume_sentinel"
 PAUSED_AT_FIELD: str = "paused_at"
 RESUME_AFTER_FIELD: str = "resume_after"
 WATCHDOG_ACTIVE_FIELD: str = "watchdog_active"
+LIVENESS_PROBE_FIELD: str = "liveness_probe"
+PAUSE_COUNT_FIELD: str = "pause_count"
 RESUME_SENTINEL: str = "benchmark output ~/bench_done.json on vast instance 12345"
 RESUME_AFTER: str = "2026-05-20T13:00:00Z"
+LIVENESS_PROBE: str = "ssh FT-NC80-v3 tmux has-session -t train"
+
+
+def _pause(*, liveness_probe: str | None) -> None:
+    pause_step(
+        task_id=TASK_ID,
+        step_number=STEP_NUMBER,
+        resume_sentinel=RESUME_SENTINEL,
+        resume_after=RESUME_AFTER,
+        watchdog_active=True,
+        liveness_probe=liveness_probe,
+    )
+
+
+def _start_default_step() -> None:
+    start_step(
+        task_id=TASK_ID,
+        step_number=STEP_NUMBER,
+        current_owner=CURRENT_OWNER,
+        heartbeat_interval_seconds=HEARTBEAT_INTERVAL_SECONDS,
+        expected_completion_at=EXPECTED_COMPLETION_AT,
+    )
 
 
 def test_pause_step_sets_paused_waiting_and_clears_owner(
@@ -327,13 +352,7 @@ def test_pause_step_sets_paused_waiting_and_clears_owner(
         heartbeat_interval_seconds=HEARTBEAT_INTERVAL_SECONDS,
         expected_completion_at=EXPECTED_COMPLETION_AT,
     )
-    pause_step(
-        task_id=TASK_ID,
-        step_number=STEP_NUMBER,
-        resume_sentinel=RESUME_SENTINEL,
-        resume_after=RESUME_AFTER,
-        watchdog_active=True,
-    )
+    _pause(liveness_probe=LIVENESS_PROBE)
 
     tracker: dict[str, object] = _read_tracker(task_id=TASK_ID)
     step: dict[str, object] = _get_step(tracker=tracker, step_number=STEP_NUMBER)
@@ -367,8 +386,150 @@ def test_pause_step_without_watchdog_is_rejected(
             resume_sentinel=RESUME_SENTINEL,
             resume_after=RESUME_AFTER,
             watchdog_active=False,
+            liveness_probe=LIVENESS_PROBE,
         )
     # The step must remain in_progress, not half-transitioned.
     tracker: dict[str, object] = _read_tracker(task_id=TASK_ID)
     step: dict[str, object] = _get_step(tracker=tracker, step_number=STEP_NUMBER)
     assert step[STATUS_FIELD] == STATUS_IN_PROGRESS
+
+
+# ---------------------------------------------------------------------------
+# pause_step records the liveness probe and counts the pauses
+# ---------------------------------------------------------------------------
+
+
+def test_pause_step_records_liveness_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    _build_tracker_with_default_steps(repo_root=tmp_path)
+    _start_default_step()
+
+    _pause(liveness_probe=LIVENESS_PROBE)
+
+    step: dict[str, object] = _get_step(
+        tracker=_read_tracker(task_id=TASK_ID),
+        step_number=STEP_NUMBER,
+    )
+    assert step[LIVENESS_PROBE_FIELD] == LIVENESS_PROBE
+    assert step[PAUSE_COUNT_FIELD] == 1
+
+
+def test_pause_step_records_null_probe_when_none_given(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    _build_tracker_with_default_steps(repo_root=tmp_path)
+    _start_default_step()
+
+    _pause(liveness_probe=None)
+
+    step: dict[str, object] = _get_step(
+        tracker=_read_tracker(task_id=TASK_ID),
+        step_number=STEP_NUMBER,
+    )
+    assert step[LIVENESS_PROBE_FIELD] is None
+    assert step[PAUSE_COUNT_FIELD] == 1
+
+
+def test_pause_step_increments_pause_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # pause_count is the belt to the probe's braces: a step that keeps re-pausing is not
+    # waiting, it is stuck, and ST-E010 needs a number that actually grows.
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    _build_tracker_with_default_steps(repo_root=tmp_path)
+    _start_default_step()
+
+    _pause(liveness_probe=LIVENESS_PROBE)
+    _pause(liveness_probe=LIVENESS_PROBE)
+    _pause(liveness_probe=LIVENESS_PROBE)
+
+    step: dict[str, object] = _get_step(
+        tracker=_read_tracker(task_id=TASK_ID),
+        step_number=STEP_NUMBER,
+    )
+    assert step[PAUSE_COUNT_FIELD] == 3
+
+
+def test_pause_step_treats_non_int_pause_count_as_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    _build_tracker_with_default_steps(repo_root=tmp_path)
+    _start_default_step()
+
+    tracker_path: Path = paths.step_tracker_path(task_id=TASK_ID)
+    tracker: dict[str, object] = _read_tracker(task_id=TASK_ID)
+    _get_step(tracker=tracker, step_number=STEP_NUMBER)[PAUSE_COUNT_FIELD] = "several"
+    tracker_path.write_text(json.dumps(tracker, indent=2) + "\n", encoding="utf-8")
+
+    _pause(liveness_probe=LIVENESS_PROBE)
+
+    step: dict[str, object] = _get_step(
+        tracker=_read_tracker(task_id=TASK_ID),
+        step_number=STEP_NUMBER,
+    )
+    assert step[PAUSE_COUNT_FIELD] == 1, "a corrupt count restarts at 1 rather than crashing"
+
+
+# ---------------------------------------------------------------------------
+# CLI: heartbeat pause --liveness-probe
+# ---------------------------------------------------------------------------
+
+
+def _cli_pause(*, extra_args: list[str]) -> int:
+    return main(
+        [
+            "pause",
+            TASK_ID,
+            str(STEP_NUMBER),
+            "--resume-sentinel",
+            RESUME_SENTINEL,
+            "--resume-after",
+            RESUME_AFTER,
+            "--watchdog-active",
+            *extra_args,
+        ],
+    )
+
+
+def test_cli_pause_records_liveness_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    _build_tracker_with_default_steps(repo_root=tmp_path)
+    _start_default_step()
+
+    exit_code: int = _cli_pause(extra_args=["--liveness-probe", LIVENESS_PROBE])
+
+    assert exit_code == 0
+    step: dict[str, object] = _get_step(
+        tracker=_read_tracker(task_id=TASK_ID),
+        step_number=STEP_NUMBER,
+    )
+    assert step[LIVENESS_PROBE_FIELD] == LIVENESS_PROBE
+
+
+def test_cli_pause_without_probe_flag_records_null(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _setup(monkeypatch=monkeypatch, repo_root=tmp_path)
+    _build_tracker_with_default_steps(repo_root=tmp_path)
+    _start_default_step()
+
+    exit_code: int = _cli_pause(extra_args=[])
+
+    assert exit_code == 0
+    step: dict[str, object] = _get_step(
+        tracker=_read_tracker(task_id=TASK_ID),
+        step_number=STEP_NUMBER,
+    )
+    assert step[LIVENESS_PROBE_FIELD] is None

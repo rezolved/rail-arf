@@ -121,6 +121,22 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, world: FakeWorld) -> None:
             return CommandResult(returncode=0, stdout="", stderr="")
         if remote_command.startswith("pkill"):
             return CommandResult(returncode=0, stdout="", stderr="")
+        if "arf-preflight" in remote_command:
+            # The preflight script is shipped as the SSH command itself and its
+            # stdout is parsed, so the catch-all below (empty stdout) would read as
+            # a failed preflight and fail every acquire test here. Literal wire keys
+            # on purpose — see the same note in test_remote_preflight.py.
+            return CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "linger_enabled": True,
+                        "persist_path": "/mnt/cache/persist",
+                        "persist_writable": True,
+                    },
+                ),
+                stderr="",
+            )
         return CommandResult(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(azure_ml_vm, "_run_az", fake_run_az)

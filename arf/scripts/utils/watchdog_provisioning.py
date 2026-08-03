@@ -10,6 +10,13 @@ the self-terminate command and the way credentials reach the VM differ:
   instance authenticates with its attached **service account** (role limited to
   ``compute.instances.stop``) using a short-lived token from the metadata
   service, so no static secret is written to disk.
+* Azure ML — pool VMs are **acquired already running** rather than created, so
+  there is no creation-time hook to carry the watchdog. The install script is
+  rendered here and piped over SSH during the ready phase; it is idempotent
+  because the same pool VM is acquired by many tasks over its lifetime. The
+  instance authenticates with its **managed identity**, and self-*stops* rather
+  than destroying: the pool VM is a reusable resource and a stopped Azure ML
+  compute instance bills nothing for compute.
 
 These renderers are pure string construction so they can be unit-tested without
 provisioning anything. See ``LESSONS.md`` Lesson 8 for why the VM must be able to
@@ -18,10 +25,16 @@ stop billing itself without depending on the orchestrator.
 
 import base64
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 WATCHDOG_SCRIPT_PATH: Path = Path(__file__).resolve().parent / "idle_watchdog.sh"
 WATCHDOG_REMOTE_PATH: str = "/opt/arf/idle_watchdog.sh"
+# Derived, never re-spelled: the `mkdir` target and the `pkill` pattern must track
+# WATCHDOG_REMOTE_PATH. Independent literals drift, and both failures only surface on
+# a live VM — a missing directory aborts the install under `set -e`, and a stale pkill
+# pattern matches nothing, leaving two watchdogs racing on a re-acquired pool VM.
+WATCHDOG_REMOTE_DIR: str = str(PurePosixPath(WATCHDOG_REMOTE_PATH).parent)
+WATCHDOG_REMOTE_NAME: str = PurePosixPath(WATCHDOG_REMOTE_PATH).name
 WATCHDOG_BOOT_LOG: str = "/var/log/arf_idle_watchdog.boot.log"
 
 # Production idle threshold; smoke tests override with a smaller value (e.g. 300).
@@ -105,7 +118,7 @@ def render_vast_onstart(*, config: WatchdogConfig) -> str:
         [
             "#!/bin/bash",
             "set -e",
-            "mkdir -p /opt/arf",
+            f"mkdir -p {WATCHDOG_REMOTE_DIR}",
             f"base64 -d > {WATCHDOG_REMOTE_PATH} <<'ARF_WD_B64'",
             encoded,
             "ARF_WD_B64",
@@ -160,3 +173,61 @@ def render_nebius_cloud_init(
         "  - systemctl enable --now arf-idle-watchdog.service",
     ]
     return "\n".join(cloud_config_lines) + "\n"
+
+
+def build_azure_ml_terminate_cmd(
+    *,
+    vm_name: str,
+    resource_group: str,
+    workspace_name: str,
+) -> str:
+    # Authenticates with the VM's managed identity, so no static secret reaches the
+    # box. `stop` rather than `delete`: pool VMs are reusable resources acquired by
+    # many tasks, and a stopped Azure ML compute instance bills nothing for compute.
+    return (
+        "az login --identity --output none; "
+        f"az ml compute stop --name {vm_name} "
+        f"--resource-group {resource_group} "
+        f"--workspace-name {workspace_name} --no-wait"
+    )
+
+
+def render_azure_ml_install_script(
+    *,
+    vm_name: str,
+    resource_group: str,
+    workspace_name: str,
+    config: WatchdogConfig,
+) -> str:
+    """Build the bash script that installs and launches the watchdog over SSH.
+
+    Azure ML pool VMs are acquired already running, so unlike Vast and Nebius there
+    is no creation-time hook. Pipe the output into ``ssh <host> "bash -s"``. Safe to
+    re-run: any watchdog already on the box is stopped before the new one launches,
+    so repeated acquisitions of the same pool VM never leave two racing.
+    """
+    encoded: str = _encode_watchdog_script()
+    terminate_cmd: str = build_azure_ml_terminate_cmd(
+        vm_name=vm_name,
+        resource_group=resource_group,
+        workspace_name=workspace_name,
+    )
+    env_assignments: str = _config_env_assignments(config=config)
+    return "\n".join(
+        [
+            "#!/bin/bash",
+            "set -e",
+            f"mkdir -p {WATCHDOG_REMOTE_DIR}",
+            # Idempotency guard: stop any previous watchdog before installing, so a
+            # pool VM acquired repeatedly never accumulates racing timers.
+            f"pkill -f {WATCHDOG_REMOTE_NAME} || true",
+            f"base64 -d > {WATCHDOG_REMOTE_PATH} <<'ARF_WD_B64'",
+            encoded,
+            "ARF_WD_B64",
+            f"chmod +x {WATCHDOG_REMOTE_PATH}",
+            f"{env_assignments} \\",
+            f"  TERMINATE_CMD='{terminate_cmd}' \\",
+            f"  nohup {WATCHDOG_REMOTE_PATH} >{WATCHDOG_BOOT_LOG} 2>&1 &",
+            "",
+        ]
+    )
