@@ -1,14 +1,23 @@
 # Rezolve ARF Lessons
 
-**Version**: 9
+**Version**: 10
 
 A curated index of generalizable lessons accumulated from Rezolve research projects that have been
 run on this framework. Each lesson lists: *what went wrong*, *why*, and *how the framework now
 mitigates it*. Lessons are referenced from individual skills and verificators so a new project
 inherits them by construction.
 
-Read this file before planning a task involving latency benchmarks, GPU provisioning, quantization,
-paired-bootstrap analysis, or any benchmark run on a fine-tuned model.
+Read this file before planning a task involving latency benchmarks, GPU provisioning, or
+paired-bootstrap analysis.
+
+This is the fork-base. A lesson belongs here only if the thing that enforces it also ships here — a
+skill, a spec, a verificator, a script. Lessons whose enforcement lives in one project's own `meta/`
+or `tasks/` belong in that project's `LESSONS.md`, not in the template, because a fork that never
+does that kind of work inherits a rule with nothing behind it.
+
+**Lesson numbers are identifiers, not positions.** Over thirty references across skills, specs,
+verificators, and scripts cite lessons by number. Never renumber; a removed lesson leaves a gap.
+Gaps at 6, 7, and 9 are project-specific lessons that live in `rail-arf-finetuning`.
 
 * * *
 
@@ -110,44 +119,6 @@ slightly different confidence intervals, and reviewers cannot reproduce reported
   `BOOTSTRAP_ITERATIONS=5000`, `PERMUTATION_ITERATIONS=10000`, `CONFIDENCE_LEVEL=0.95`.
 * These values are intentionally cross-project constants — keep them stable so results from
   different Rezolve projects remain comparable.
-
-* * *
-
-## Lesson 6: Frozen-baseline contract
-
-**What went wrong** (rail-arf-serving t0014 → t0015 → t0017 → t0018): a pattern of "clone the
-baseline config, add one flag, run paired sweep" worked great until someone modified the baseline
-asset. All downstream ablations then silently computed wrong deltas against a moving target.
-
-**Why**: ARF's task-isolation rules prevent edits to *other* task folders, but they do not prevent a
-later task from registering a new asset under the same name in its own folder. Aggregators apply the
-corrections overlay but downstream tasks may pin the wrong version.
-
-**Mitigation in the framework**:
-
-* Baseline configs (e.g., `vllm_config`, `model_config`) used by multiple downstream tasks should be
-  named with a `_FROZEN` suffix and a version (`_v1`, `_v2`). Downstream ablations reference the
-  baseline by ID **and** a git-commit SHA at which the baseline was last validated.
-* If a baseline needs revision, register a new `_v2` asset rather than mutating `_v1`.
-
-* * *
-
-## Lesson 7: Pre-validate quantization checkpoints offline
-
-**What went wrong** (rail-arf-serving t0018): both FP8 W8A8 and AWQ candidates failed at engine
-launch. The checkpoints existed on HuggingFace but were either the wrong dtype (FP8 enum not
-accepted by `compressed-tensors` adapter) or missing AWQ-specific tensors (`qweight`, `qzeros`,
-`scales`).
-
-**Why**: quantization format compatibility is implicit. There is no `pip check` equivalent for
-checkpoint × engine compatibility — it fails at runtime, after VM provisioning.
-
-**Mitigation in the framework**:
-
-* Any task plan that includes quantization must list a `## Checkpoint Validation` step that runs
-  **before** VM provisioning. The step downloads `config.json` and inspects safetensors shard keys
-  for the expected quantization-specific tensors. Document the validated HuggingFace model IDs and
-  commit SHAs in the plan.
 
 * * *
 
@@ -278,45 +249,6 @@ when the prose version already exists and reads convincingly.
 
 * * *
 
-## Lesson 9: Fine-tuned-model benchmarks need a full side-by-side report, not a metrics table
-
-**What went wrong** (rail-arf-finetuning t0017): a task that benchmarked a fine-tuned (FT) model
-produced an HTML report that omitted the benchmark conversation itself. The report showed scores
-without the dialog fed to the model, the model's actual answers, or the judge's reasoning. Reviewers
-could not see *why* a case passed or failed, nor isolate where the FT model regressed against base —
-so the report had to be regenerated.
-
-**Why**: aggregate accuracy and pass/fail counts hide the behavior that fine-tuning actually
-changed. Understanding an FT result requires reading, per case, the exact conversation prefix, both
-the base and FT answers, and the judge verdict plus reasoning — side by side — and filtering to the
-cases where FT did better or worse than base. A bare metrics table cannot answer "what did
-fine-tuning change, and was it for the better?", which is the entire point of the comparison.
-
-**Mitigation in the framework**:
-
-* Every task that runs a benchmark on a fine-tuned model must produce a
-  `benchmark_comparison_report` asset (`meta/asset_types/benchmark_comparison_report/`). Per case it
-  captures: (1) the benchmark conversation prefix (the full dialog fed to the model), (2) both model
-  answers (base **and** FT), and (3) the judge verdict + full reasoning for each. The asset's
-  `report.html` is a self-contained side-by-side rendering with summary cards (per-model accuracy,
-  improvement %, improved/declined counts) and tabbed/filterable views — Improved (base failed, FT
-  passed), Declined (base passed, FT failed), Both Passed, Both Failed, All — so reviewers can
-  isolate regressions and gains.
-* The structured `cases.jsonl` is the source of truth and the verifiable artifact;
-  `meta/asset_types/benchmark_comparison_report/generate_report.py` renders `details.json` and
-  `report.html` from it. The visual reference design is
-  `real-repos/rail-benchmarks/azure-ai-foundry/clarification-benchmarks/generate_comparison_report.py`.
-* `meta/asset_types/benchmark_comparison_report/verificator.py` enforces completeness: it fails
-  (`BCR-E008`/`BCR-E009`/`BCR-E010`) when any case lacks the conversation prefix, both answers, or
-  both judge reasonings — the exact t0017 gap — and checks bucket/summary consistency.
-* `arf/skills/planning/SKILL.md` requires this asset as a planned deliverable for any FT-model
-  benchmark task, pre-registered before running.
-* The `experiment-run`, `comparative-analysis`, `baseline-evaluation`, and `build-model` task-type
-  instruction files (`meta/task_types/*/instruction.md`) carry the requirement in their
-  Implementation Guidelines and Verification Additions so FT benchmark plans inherit it.
-
-* * *
-
 ## Lesson 10: Azure ML VM persistent storage requires an explicit symlink — `/mnt` is ephemeral
 
 **What went wrong** (rail-arf-finetuning t0007): `train_supervisor.sh` wrote training checkpoints
@@ -427,9 +359,14 @@ completely normal (no error) right up to the kill.
 
 When a Rezolve research project produces a generalizable lesson:
 
-1. Add a new `## Lesson N: <one-line headline>` section to this file.
-2. Use the four-part structure: *What went wrong* (with task/project reference), *Why*, *Mitigation
+1. Decide where it belongs. If the thing that enforces it ships in this repo, the lesson goes here.
+   If the enforcement lives in one project's own `meta/` or `tasks/`, the lesson goes in that
+   project's `LESSONS.md`. Write it down once, in the repo that can act on it.
+2. Add a new `## Lesson N: <one-line headline>` section, taking the next unused number. Never reuse
+   a gap and never renumber — the numbers are cited from code.
+3. Use the four-part structure: *What went wrong* (with task/project reference), *Why*, *Mitigation
    in the framework*.
-3. Implement the mitigation as a default in the relevant skill, asset spec, or verificator. A lesson
-   without a corresponding default is just a complaint.
-4. Increment the file's `**Version**` line at the top.
+4. Implement the mitigation as a default in the relevant skill, asset spec, or verificator. A lesson
+   without a corresponding default is just a complaint. Name the enforcing file by path, so the
+   claim can be checked rather than believed.
+5. Increment the file's `**Version**` line at the top.
