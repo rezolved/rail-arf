@@ -1,14 +1,23 @@
 # Rezolve ARF Lessons
 
-**Version**: 2
+**Version**: 10
 
 A curated index of generalizable lessons accumulated from Rezolve research projects that have been
 run on this framework. Each lesson lists: *what went wrong*, *why*, and *how the framework now
 mitigates it*. Lessons are referenced from individual skills and verificators so a new project
 inherits them by construction.
 
-Read this file before planning a task involving latency benchmarks, GPU provisioning, quantization,
-or paired-bootstrap analysis.
+Read this file before planning a task involving latency benchmarks, GPU provisioning, or
+paired-bootstrap analysis.
+
+This is the fork-base. A lesson belongs here only if the thing that enforces it also ships here — a
+skill, a spec, a verificator, a script. Lessons whose enforcement lives in one project's own `meta/`
+or `tasks/` belong in that project's `LESSONS.md`, not in the template, because a fork that never
+does that kind of work inherits a rule with nothing behind it.
+
+**Lesson numbers are identifiers, not positions.** Over thirty references across skills, specs,
+verificators, and scripts cite lessons by number. Never renumber; a removed lesson leaves a gap.
+Gaps at 6, 7, and 9 are project-specific lessons that live in `rail-arf-finetuning`.
 
 * * *
 
@@ -113,44 +122,6 @@ slightly different confidence intervals, and reviewers cannot reproduce reported
 
 * * *
 
-## Lesson 6: Frozen-baseline contract
-
-**What went wrong** (rail-arf-serving t0014 → t0015 → t0017 → t0018): a pattern of "clone the
-baseline config, add one flag, run paired sweep" worked great until someone modified the baseline
-asset. All downstream ablations then silently computed wrong deltas against a moving target.
-
-**Why**: ARF's task-isolation rules prevent edits to *other* task folders, but they do not prevent a
-later task from registering a new asset under the same name in its own folder. Aggregators apply the
-corrections overlay but downstream tasks may pin the wrong version.
-
-**Mitigation in the framework**:
-
-* Baseline configs (e.g., `vllm_config`, `model_config`) used by multiple downstream tasks should be
-  named with a `_FROZEN` suffix and a version (`_v1`, `_v2`). Downstream ablations reference the
-  baseline by ID **and** a git-commit SHA at which the baseline was last validated.
-* If a baseline needs revision, register a new `_v2` asset rather than mutating `_v1`.
-
-* * *
-
-## Lesson 7: Pre-validate quantization checkpoints offline
-
-**What went wrong** (rail-arf-serving t0018): both FP8 W8A8 and AWQ candidates failed at engine
-launch. The checkpoints existed on HuggingFace but were either the wrong dtype (FP8 enum not
-accepted by `compressed-tensors` adapter) or missing AWQ-specific tensors (`qweight`, `qzeros`,
-`scales`).
-
-**Why**: quantization format compatibility is implicit. There is no `pip check` equivalent for
-checkpoint × engine compatibility — it fails at runtime, after VM provisioning.
-
-**Mitigation in the framework**:
-
-* Any task plan that includes quantization must list a `## Checkpoint Validation` step that runs
-  **before** VM provisioning. The step downloads `config.json` and inspects safetensors shard keys
-  for the expected quantization-specific tensors. Document the validated HuggingFace model IDs and
-  commit SHAs in the plan.
-
-* * *
-
 ## Lesson 8: Orchestrator must own step liveness — fire-and-forget handoffs cause idle billing
 
 **What went wrong** (rail-arf-serving, GPU benchmark task): a subagent driving an `implementation`
@@ -183,6 +154,204 @@ running.
   `arf/scripts/utils/watchdog_provisioning.py`) — the watchdog, not the orchestrator, is what
   guarantees a missed wakeup cannot leave the box billing. The `/diagnose-stuck-step` skill produces
   a structured recovery report for any flagged step.
+* `arf/skills/execute-task/SKILL.md` Phase −0.5 forbids ending an invocation with any step left
+  `in_progress` unless a `ScheduleWakeup` is registered — ending a turn to await a notification that
+  no component will send is the same fire-and-forget bug wearing a different hat.
+* `arf/scripts/hooks/verify_logs_on_stop.py`, the `Stop` hook registered in `.claude/settings.json`,
+  is what makes that Phase −0.5 rule more than prose: it blocks the first attempt to end a turn
+  while a live task still holds an `in_progress` step. See the fourth follow-up for what it does and
+  does not guarantee.
+* `/setup-remote-machine` Phase 3 installs the watchdog on **every** GPU machine, not only on ones
+  that will pause, and records `watchdog_active` in `machine_log.json` only after confirming a PID.
+  `verify_step_liveness` flags an unprotected live machine as `ST-W008`.
+
+**Follow-up (2026-07-31)**: an audit prompted by a task sitting stale for ~8 hours found that the
+detection half of this mitigation had never worked. `verify_step_liveness` and
+`/diagnose-stuck-step` both identified a live VM by `actual_status == "running"` — a Vast.ai
+provider-API field that is never written into `machine_log.json`. Every machine therefore read as
+destroyed: `ST-E007` silently degraded to the `ST-W005` warning, the verificator exited `0`, and the
+diagnostic skill concluded "no VM" without probing. Liveness is now defined as non-empty
+`instance_id` and absent `destroyed_at`, the same signal `RM-E001` already used.
+
+The generalizable part: a detector keyed on a field the schema does not guarantee fails silently,
+and it fails in the safe-looking direction. Two habits prevent it — pin a detector to a field its
+own specification requires, and build test fixtures from the real schema instead of letting the test
+invent a field the producer never writes. The unit test here passed for months because it wrote
+`actual_status` into its own fixture.
+
+**Second follow-up (2026-07-31)**: fixing the detector was not enough, because nothing fed it.
+`prestep.py` marked every step `in_progress` writing only `status`, `started_at`, and `log_file` —
+never the liveness fields — and nothing stamped `spec_version` on a tracker. So `ST-E007`,
+`ST-W005`, and `ST-W006`, which all need `last_heartbeat_at`, and `ST-E009`, which needs
+`spec_version`, were dormant across every task in the project. `heartbeat.py` implemented the
+contract correctly and completely, and no step-executor ever called it. A task then sat silent for
+14 hours holding an H100 while the liveness scan reported clean — a scan with no data has no
+findings.
+
+`prestep` now arms all four fields and stamps `spec_version`; `poststep` and `skip_step` finalize.
+Arming happens in the lifecycle, not in the step's own code, so a step is monitorable from the
+moment it starts whether or not its owner ever heartbeats again.
+
+The generalizable part: **a contract that depends on every participant remembering to call an API is
+not in force.** When adding a rule that reads a field, check who writes it, and put the write
+somewhere mandatory rather than somewhere polite. The tell is cheap to look for — grep for a
+*producer* of the field, not just a consumer. Here the producer count was zero, and both the
+specification and a fully passing test suite described a system that did not exist.
+
+**Third follow-up (2026-07-31)**: an audit of the finished liveness stack found the sanctioned
+release path had no failure branch. `pause_step` recorded only a prose `resume_sentinel`, and the
+resume instruction was "re-check the sentinel and either finish or pause again". A remote job that
+dies mid-wait never produces its sentinel, so resume re-pauses — every wakeup, indefinitely. The
+watchdog stops the VM an hour later, which bounds the money and hides the symptom: the task now
+reads as "waiting" forever on a job that no longer exists, and only a human reading a log finds out.
+
+A pause now records a `liveness_probe` (a command that exits `0` while the work runs), and resume is
+a three-way decision — finished, alive, or **dead** — driven by `arf/scripts/utils/resume_check.py`
+rather than by a skill's judgement. `pause_count` is the belt to that brace: it needs no SSH, so it
+catches the pause that recorded no probe at all, and `ST-E010` fires past 12 re-pauses.
+
+The generalizable part: **a wait state needs a way to fail, not just a way to continue.** Any
+"check, then sleep again" loop where the check can never turn true is a hang wearing the costume of
+patience. When adding one, ask what makes it stop being true — and if the answer is only "the thing
+we are waiting for arrives", add the branch for the thing that never arrives. A bounded retry count
+is the cheap version, and it belongs there even when a smarter check exists.
+
+**Fourth follow-up (2026-08-03)**: with the detector fixed, its data armed, and a pause that can
+fail, a step-executor left an SFT training job running, returned control expecting a self-made
+background poller to wake it, and the step sat `in_progress` and unattended for ~20 hours. Azure's
+idle shutdown stopped the billing; nothing else would have. The training had in fact finished
+cleanly — what was lost was a night of wall-clock, not data.
+
+Every part of the liveness stack ran correctly and none of it helped, because all of it only
+executes **when something invokes the orchestrator**, and nothing does. `verify_step_liveness --all`
+is run by `execute-task` Phase −1, which requires a wakeup that never came. The rule against this
+existed, in prose, in two skills the executor was following: `implementation` v12 forbids
+fire-and-forget background pollers, and `execute-task` v26 forbids ending an invocation with an
+`in_progress` step and no `ScheduleWakeup`. Both were live. Both were violated.
+
+The mitigation is the `Stop` hook, `arf/scripts/hooks/verify_logs_on_stop.py` (PR #91): it runs on
+every attempt to end a turn — the one moment guaranteed to happen — and exits `2` when a live task
+still carries an `in_progress` step, returning the two legal exits to the agent. Recorded at the
+same time, not left for a later audit to find: it is **one forced reminder per turn, not enforcement
+by construction.** `stop_hook_active` short-circuits the check on the repeat stop, so an agent can
+be blocked once, change nothing, and leave; and the hook cannot see whether a wakeup was actually
+registered, because schedules live in session memory rather than on disk. It closes the silent exit,
+not every exit. Nothing yet survives the death of the Claude session itself — there, the VM watchdog
+and the provider's idle shutdown are still the only floors.
+
+The generalizable part, and the reason this is a fourth follow-up rather than a new lesson: **this
+is the same failure shape for the third time.** A rule that lives only in text addressed to an agent
+is not in force — the same sentence as the second follow-up, applied to a rule instead of a field.
+The tell is cheap to check at the moment of writing, and cheaper than the audit that finds it later:
+ask who *executes* the new rule, not who is *told* it. If the answer is "the agent, if it
+remembers", put it on a path the lifecycle runs — a hook, a `prestep`, a provisioning script — even
+when the prose version already exists and reads convincingly.
+
+* * *
+
+## Lesson 10: Azure ML VM persistent storage requires an explicit symlink — `/mnt` is ephemeral
+
+**What went wrong** (rail-arf-finetuning t0007): `train_supervisor.sh` wrote training checkpoints
+and the final SFT-LoRA adapter to `/mnt/cache/persist/runs/sft_v1/adapter/` using `mkdir -p`. The
+directory was created on the ephemeral `/mnt` temp disk, not on the Azure Files share, because the
+symlink `/mnt/cache/persist → <azure-files-mount>` was never created. When the VM was stopped after
+t0007, `/mnt` was wiped and the adapter was lost. It survived only because it had been DVC-pushed to
+blob storage before the VM stopped.
+
+**Why**: Azure ML VMs mount an Azure Files SMB share into the container at a deep path under
+`/mnt/batch/tasks/shared/LS_root/mounts/clusters/<vm-name>/code/`. This path survives VM stop and
+restart. The `/mnt` directory itself (a temp disk) is ephemeral and wiped on every stop. Any
+`mkdir -p /mnt/cache/persist` call silently creates a directory on the ephemeral disk rather than
+pointing at the persistent share, and there is no error — the path just vanishes on the next stop.
+
+**Mitigation in the framework**:
+
+* **Confirmed persistent storage path pattern for Rezolve Azure ML VMs**:
+
+  ```
+  /mnt/batch/tasks/shared/LS_root/mounts/clusters/<vm-name>/code/
+  ```
+
+  Example for FT-NC80-v1: `/mnt/batch/tasks/shared/LS_root/mounts/clusters/ft-nc80-v1/code/`
+
+  100 TB quota; ~4.4 TB used as of 2026-06. Shared workspace-level share — all VMs in the
+  `finetuning-workspace` see the same data under their own `clusters/<vm-name>/code/` sub-path.
+
+* **Every training task must verify the symlink resolves to the real mount before writing any
+  checkpoint**. `/mnt/cache/persist` is a symlink, but a symlink pointing to an unmounted or wrong
+  target is silent data loss. Add this to the Setup Machine step:
+
+  ```bash
+  # Verify the symlink target is the actual Azure Files mount (not ephemeral /mnt)
+  readlink -f /mnt/cache/persist
+  # Expected: /mnt/batch/tasks/shared/LS_root/mounts/clusters/<vm-name>/code
+
+  # Confirm mounted and writable
+  df -h /mnt/cache/persist   # must show the Azure Files share, not tmpfs
+  touch /mnt/cache/persist/.write_test && rm /mnt/cache/persist/.write_test
+
+  # If readlink resolves to an ephemeral /mnt path, fix the symlink:
+  ln -sfn /mnt/batch/tasks/shared/LS_root/mounts/clusters/$(hostname)/code \
+      /mnt/cache/persist
+  ```
+
+* Write **all** checkpoints, intermediate artifacts, and final adapters to paths under
+  `/mnt/cache/persist/`. Write nothing training-related directly under `/mnt/` — it is ephemeral.
+
+* DVC-push each adapter **immediately after it completes** (before the VM is stopped or the next
+  training step begins) as a second safety net. DVC blob storage is the recovery path if the Azure
+  Files share itself is unavailable.
+
+* **The check runs in the lifecycle, not in a skill's prose.**
+  `arf/scripts/utils/remote_preflight.sh` performs exactly the block above — resolve, repair with
+  `ln -sfn`, verify writable — and `azure_ml_vm.acquire()` pipes it over SSH before it places the
+  task lock. A VM whose persistent mount is missing or unwritable is rejected with
+  `failure_phase: "preflight"` and the provisioner moves to the next pool entry, so no job ever
+  starts on a box that will silently eat its checkpoints.
+
+**Follow-up (2026-07-31)**: this mitigation previously read "`setup-remote-machine/SKILL.md` and any
+implementation skill that starts GPU work *should* include the symlink verification". It never did —
+a `grep` for `readlink` across `arf/` returned nothing at all. The lesson had been written down,
+declared mitigated, and implemented nowhere, which is the same failure Lesson 8's second follow-up
+describes: a contract nobody executes is not in force. The fix is not a better-worded instruction;
+it is a script on a mandatory path.
+
+* * *
+
+## Lesson 11: `tmux` alone does not survive SSH disconnection without `loginctl enable-linger`
+
+**What went wrong** (rail-arf-finetuning t0021): a DPO training job launched inside a named `tmux`
+session on FT-NC80-v1 was killed ~24 minutes in, at step 27/540, with exit code 143 (SIGTERM). No
+OOM, no GPU fault, no spot preemption (the VM has no priority/spot tier). `journalctl` showed
+`systemd-logind: Removed session N` at the exact second of the crash: when the SSH session that
+launched `tmux` ended, `systemd-logind` tore down that user's entire session scope — including the
+detached `tmux` server and everything running inside it — because `azureuser` had `Linger=no` (the
+Ubuntu default).
+
+**Why**: `tmux new-session -d` detaches the session from the *terminal*, but on systemd-managed
+Linux hosts the processes still belong to the *login session's cgroup scope* unless lingering is
+enabled. `Linger=no` means `systemd-logind` cleans up that scope (SIGTERM then SIGKILL to everything
+in it) as soon as the last session for that user closes — even though `tmux` itself keeps running as
+a server, its child processes get torn down. This is easy to miss because `tmux has-session` right
+after disconnecting still reports the session as alive for a window, and the training log looks
+completely normal (no error) right up to the kill.
+
+**Mitigation in the framework**:
+
+* `arf/scripts/utils/remote_preflight.sh` runs `loginctl enable-linger` for the SSH user and
+  **verifies** `Linger=yes` before any job is launched. `azure_ml_vm.acquire()` runs it over SSH
+  before placing the task lock, so lingering is a property of every acquired machine rather than a
+  step someone has to remember. A box where lingering cannot be enabled is rejected with
+  `failure_phase: "preflight"`.
+* `arf/skills/setup-remote-machine/SKILL.md`'s "Running long jobs" section explains why both
+  guarantees exist and how to re-check them by hand — `tmux` and lingering are both required,
+  neither alone is sufficient.
+* When diagnosing an unexplained mid-job SIGTERM (rc=143) with no OOM/GPU/preemption evidence, check
+  `journalctl -u user@$(id -u).service` (or `journalctl | grep logind`) for a `Removed session`
+  entry at the crash timestamp before assuming spot eviction or a code bug.
+* Training/eval scripts that write periodic checkpoints (as Lesson 10 already requires for the
+  persistent-storage path) limit the blast radius of this failure mode to the checkpoint interval,
+  not the whole run — keep checkpoint intervals short relative to expected job duration.
 
 * * *
 
@@ -190,9 +359,14 @@ running.
 
 When a Rezolve research project produces a generalizable lesson:
 
-1. Add a new `## Lesson N: <one-line headline>` section to this file.
-2. Use the four-part structure: *What went wrong* (with task/project reference), *Why*, *Mitigation
+1. Decide where it belongs. If the thing that enforces it ships in this repo, the lesson goes here.
+   If the enforcement lives in one project's own `meta/` or `tasks/`, the lesson goes in that
+   project's `LESSONS.md`. Write it down once, in the repo that can act on it.
+2. Add a new `## Lesson N: <one-line headline>` section, taking the next unused number. Never reuse
+   a gap and never renumber — the numbers are cited from code.
+3. Use the four-part structure: *What went wrong* (with task/project reference), *Why*, *Mitigation
    in the framework*.
-3. Implement the mitigation as a default in the relevant skill, asset spec, or verificator. A lesson
-   without a corresponding default is just a complaint.
-4. Increment the file's `**Version**` line at the top.
+4. Implement the mitigation as a default in the relevant skill, asset spec, or verificator. A lesson
+   without a corresponding default is just a complaint. Name the enforcing file by path, so the
+   claim can be checked rather than believed.
+5. Increment the file's `**Version**` line at the top.

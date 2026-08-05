@@ -1,6 +1,6 @@
 # Remote Machines Specification
 
-**Version**: 5
+**Version**: 6
 
 * * *
 
@@ -102,7 +102,7 @@ may use several.
 
 | Field | Type | Required | Applies to | Set during | Description |
 | --- | --- | --- | --- | --- | --- |
-| `spec_version` | string | yes (v5+) | all | creating | Spec version (e.g., `"5"`). Legacy entries with `"4"` or earlier or no field are treated permissively (warning only). |
+| `spec_version` | string | yes (v5+) | all | creating | Spec version (e.g., `"6"`). Legacy entries with `"5"` or earlier or no field are treated permissively (warning only). |
 | `provider` | string enum | yes | all | creating | One of `"vast_ai"`, `"azure_ml"`, or `"nebius"` |
 | `instance_id` | string | yes | all | creating | Provider-specific instance ID (Vast offer instance ID, Azure VM name, or Nebius `computeinstance-...` ID) |
 | `selected_offer` | object | yes | both | searching | Details of the chosen offer / pool VM (see below) |
@@ -116,6 +116,8 @@ may use several.
 | `cuda_version` | string | yes | both | ready | CUDA version from `nvidia-smi` |
 | `created_at` | string | yes | both | creating | ISO 8601 timestamp |
 | `ready_at` | string | yes | both | ready | ISO 8601 timestamp |
+| `watchdog_active` | bool | yes (v6+) | both | ready | `true` once the idle dead-man's-switch watchdog is installed and its PID confirmed. Every GPU machine must carry one before a step runs work on it |
+| `watchdog_idle_timeout_seconds` | int\|null | yes (v6+) | both | ready | Idle timeout the watchdog enforces before self-destruct; `null` only when `watchdog_active` is `false` |
 | `destroyed_at` | string\|null | yes | both | destroyed | ISO 8601 timestamp, `null` until destroyed |
 | `total_duration_hours` | float\|null | yes | both | destroyed | Hours from `created_at` to `destroyed_at` |
 | `total_cost_usd` | float\|null | yes | both | destroyed | Final cost from provider, `null` until known |
@@ -514,6 +516,42 @@ no offer marketplace and no price negotiation — every VM in the pool bills at 
 The whole walk, including `failed_attempts` for any VMs skipped on the way to the chosen one, is
 recorded in `machine_log.json`. Stale locks (owned by tasks already in a terminal state) should be
 cleared before the walk — see `LESSONS.md` Lesson 8.
+
+* * *
+
+## Mandatory Idle Watchdog
+
+Every GPU machine MUST carry the idle dead-man's-switch watchdog
+(`arf/scripts/utils/idle_watchdog.sh`) before any step runs work on it. The watchdog polls GPU
+utilization and self-terminates the machine after a continuous idle period, so a machine cannot bill
+indefinitely when nothing is driving it.
+
+This is not optional and not limited to `paused_waiting` steps. Every liveness gap on the
+orchestrator side — a ghosted owner, an unmonitorable step, a session that ended without a
+`ScheduleWakeup` — ends with a machine nobody is driving. Detection only helps when someone is awake
+to read it; the watchdog runs on the machine itself and depends on no agent waking up, so it is the
+only mechanism that bounds the loss. `verify_step_liveness` flags a live machine whose
+`machine_log.json` entry lacks `watchdog_active: true` as `ST-W008`.
+
+`arf/scripts/utils/watchdog_provisioning.py` renders the installation for each provider. The install
+path differs because the providers hand over machines differently:
+
+| Provider | Install path | Self-terminate |
+| --- | --- | --- |
+| Vast.ai | Instance `onstart` script, set at creation | `vastai destroy instance` with the container's own API key |
+| Nebius | `#cloud-config` systemd unit, set at creation | `nebius compute instance stop` with the instance service-account token |
+| Azure ML | Bash script run over SSH after acquisition | `az ml compute stop` authenticated with the VM's managed identity |
+
+Azure ML pool VMs are **acquired already running** rather than created, so they have no
+creation-time hook: the watchdog is installed over SSH during the ready phase, and the install must
+be idempotent because the same pool VM is acquired by many tasks over its lifetime. Azure's
+terminate command *stops* the VM rather than destroying it — the pool VM is a reusable resource, and
+a stopped Azure ML compute instance bills nothing for compute.
+
+A watchdog that cannot terminate is worse than none, because it produces `watchdog_active: true`
+while protecting nothing. `idle_watchdog.sh` therefore refuses to run without `TERMINATE_CMD`, and
+provisioning must record `watchdog_active: false` whenever the install or the PID confirmation
+fails, rather than assuming success.
 
 * * *
 

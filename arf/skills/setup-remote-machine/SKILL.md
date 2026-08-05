@@ -7,7 +7,7 @@ description: >-
 ---
 # Setup Remote Machine
 
-**Version**: 5
+**Version**: 9
 
 ## Goal
 
@@ -63,6 +63,21 @@ Read before starting:
    ~$110. `azure_ml_vm teardown` will stop the VM unless another task holds a lock on it; only pass
    `--keep-running` when the user has explicitly approved keeping the VM hot.
 
+4. **Keep the step heart-beating.** Provisioning routinely runs 10+ minutes — cold start alone is ~4
+   minutes, before SSH setup, storage checks, and version capture. Refresh the step tracker after
+   each phase:
+
+   ```bash
+   uv run python -m arf.scripts.utils.heartbeat write $TASK_ID <step_number> \
+     setup-remote-machine/setup-machines
+   ```
+
+   This is the step-tracker heartbeat, which is a different thing from the `heartbeat_path` file on
+   the VM recorded for jobs over 2 hours (Phase 4). The tracker heartbeat is what tells the
+   orchestrator this step is still alive; the VM file tracks a long job's progress. A provisioning
+   step that stops beating is indistinguishable from one whose executor died — and it dies holding a
+   billing GPU, which is the worst step in the whole workflow to go silent in.
+
 * * *
 
 ## Steps
@@ -108,6 +123,16 @@ Read before starting:
      `tasks/$TASK_ID/intervention/pool_busy.md`. STOP and let the user resolve.
    * Exit code `1` — generic error; surface stderr to the user and STOP.
 
+   Between the SSH check and the lock, `acquire` runs `arf/scripts/utils/remote_preflight.sh` on the
+   box. It enables `systemd` lingering for the SSH user and guarantees `/mnt/cache/persist` resolves
+   to the real Azure Files mount, repairing the symlink when it points at the ephemeral disk. These
+   are LESSONS.md Lessons 11 and 10 — a killed training job and a lost adapter — and both used to be
+   prose in this skill that nothing executed. A VM that fails preflight is **not used**: the attempt
+   is recorded in `failed_attempts` with `failure_phase: "preflight"` and the provisioner moves to
+   the next pool entry. If every entry fails that way, read the recorded reasons before touching a
+   box by hand; a whole pool failing preflight usually means the image or the mount changed, not
+   that four VMs broke at once.
+
 2. Save the JSON output as the basis for `machine_log.json`. Use `to_machine_log_entry()` from the
    library to convert it to the schema consumed by `aggregate_machines.py`:
 
@@ -140,6 +165,39 @@ Read before starting:
 
 3. Update `machine_log.json` with `gpu_verified` and `cuda_version`.
 
+4. **Install the idle watchdog** (MANDATORY — no step may run work on a machine without one). For
+   Vast.ai and Nebius the watchdog is baked into the creation hook (`onstart` / `#cloud-config`) and
+   is already running by this phase, so confirm it rather than reinstalling. Azure ML pool VMs are
+   acquired already running and have no creation hook, so install over SSH:
+
+   ```bash
+   uv run python -u -c "
+   from arf.scripts.utils.watchdog_provisioning import (
+       WatchdogConfig, render_azure_ml_install_script)
+   print(render_azure_ml_install_script(
+       vm_name='$VM_NAME', resource_group='$RESOURCE_GROUP',
+       workspace_name='$WORKSPACE_NAME', config=WatchdogConfig()))
+   " | ssh "$SSH_HOST" "bash -s"
+   ```
+
+   The install is idempotent — safe to re-run on a pool VM that already carries a watchdog.
+
+5. Confirm the watchdog is actually alive before recording success:
+
+   ```bash
+   ssh "$SSH_HOST" "pgrep -f idle_watchdog.sh"
+   ```
+
+   Record `watchdog_active: true` and `watchdog_idle_timeout_seconds` in `machine_log.json` only
+   when a PID comes back. On failure record `watchdog_active: false` and treat it as a blocker: fix
+   the install or tear the machine down. Never record `true` without a confirmed PID — a watchdog
+   that cannot terminate protects nothing while making the machine look protected.
+
+   The watchdog is what bounds spend when the orchestrator side fails. A ghosted step, a session
+   that ended without a `ScheduleWakeup`, and a missed resume all end the same way: a machine nobody
+   is driving. Only the machine itself can stop billing then. `verify_step_liveness` flags a live
+   machine without `watchdog_active: true` as `ST-W008`.
+
 ### Phase 4: Prepare environment
 
 1. Copy data to the remote VM. Use `scp` for files under 100 MB; for larger transfers use `rsync`:
@@ -162,11 +220,11 @@ Read before starting:
 
 4. **Engine smoke gate** (MANDATORY for any task that will issue measurement requests). After
    installing the task-specific engine (vLLM, SGLang, TRT-LLM, etc.) and launching it, issue one
-   trivial request (a `health`/`/version` endpoint check **and** one minimum-length chat
-   completion) before any warmup or measured phase. If either fails, mark the condition `null`
-   and skip directly to teardown — do not waste VM time on a broken engine. Record the smoke
-   result in `machine_log.json` under `smoke_gate_status` (`pass` or `fail`) with the failure
-   reason. See `LESSONS.md` (Lesson 2: smoke-gate before measurement) for the rationale.
+   trivial request (a `health`/`/version` endpoint check **and** one minimum-length chat completion)
+   before any warmup or measured phase. If either fails, mark the condition `null` and skip directly
+   to teardown — do not waste VM time on a broken engine. Record the smoke result in
+   `machine_log.json` under `smoke_gate_status` (`pass` or `fail`) with the failure reason. See
+   `LESSONS.md` (Lesson 2: smoke-gate before measurement) for the rationale.
 
 5. For jobs over 2 hours, configure checkpointing and a heartbeat file. Record both paths in
    `machine_log.json` as `checkpoint_path` and `heartbeat_path`. See
@@ -180,7 +238,28 @@ Referenced by the `implementation` step in execute-task.
 
 ### Running long jobs
 
-Always launch long jobs inside `tmux` so they survive SSH disconnection:
+Lingering and the persistent-storage symlink are **already guaranteed** by the time execution
+starts: `azure_ml_vm acquire` runs `arf/scripts/utils/remote_preflight.sh` on the box before it
+places the lock, and refuses the VM when either guarantee fails (Phase 2, step 1). Nothing here
+needs to re-run them. What follows is why they matter, so a `preflight` failure in `failed_attempts`
+is recognizable.
+
+`tmux` alone does NOT survive SSH disconnection (LESSONS.md Lesson 11): on systemd-managed hosts
+`systemd-logind` tears down the whole login-session cgroup scope — killing everything inside `tmux`,
+SIGTERM then SIGKILL — as soon as the launching SSH session ends, unless lingering is enabled for
+that user. The failure is silent: `tmux has-session` still reports the session alive for a window
+after disconnect, and the job log shows no error before the kill.
+
+`/mnt/cache/persist` must resolve to the Azure Files share, not the ephemeral `/mnt` temp disk
+(LESSONS.md Lesson 10). A `mkdir -p` under the ephemeral disk succeeds silently and the data is
+wiped on the next VM stop. To re-check either guarantee by hand:
+
+```bash
+ssh FT-NC80-v3 "loginctl show-user azureuser | grep Linger"   # must show Linger=yes
+ssh FT-NC80-v3 "readlink -f /mnt/cache/persist && df -h /mnt/cache/persist"
+```
+
+Launch long jobs inside `tmux` so they survive SSH disconnection:
 
 ```bash
 ssh FT-NC80-v3 "tmux new-session -d -s work \
@@ -325,7 +404,9 @@ For teardown:
 
 * NEVER run `prestep` or `poststep` — the orchestrator handles the step lifecycle.
 * NEVER commit — the orchestrator handles all commits.
-* NEVER modify `step_tracker.json` — the orchestrator manages step state.
+* NEVER modify `step_tracker.json` directly — the orchestrator manages step state. Refreshing the
+  heartbeat via `arf.scripts.utils.heartbeat` (Critical Rule 4) is the one sanctioned exception: it
+  touches only `last_heartbeat_at` and `current_owner`, never status or step structure.
 * NEVER write `step_log.md` — the orchestrator writes it after this skill completes.
 * NEVER leave a VM running without a corresponding `teardown` step in `step_tracker.json`.
 * NEVER skip the budget check in Phase 1.

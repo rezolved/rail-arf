@@ -77,7 +77,7 @@ _KNOWN_PROVIDERS: tuple[str, ...] = (
 _NEBIUS_ACTIVE_STATES: tuple[str, ...] = ("RUNNING", "STARTING", "PROVISIONING")
 _FIELD_INSTANCE_ID_NEBIUS: str = "instance_id"
 
-_SPEC_VERSION_CURRENT: str = "5"
+_SPEC_VERSION_CURRENT: str = "6"
 
 VASTAI_SHOW_TIMEOUT: float = 15.0
 AZ_ML_SHOW_TIMEOUT: float = 15.0

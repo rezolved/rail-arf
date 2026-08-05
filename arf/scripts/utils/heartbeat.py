@@ -11,6 +11,17 @@ Owners of an ``in_progress`` step call this module to maintain the liveness fiel
 * ``complete_step`` — transitions the step to ``completed`` and computes
   ``actual_duration_seconds`` from ``started_at`` to ``completed_at``.
 
+The step lifecycle scripts (``prestep``, ``poststep``, ``skip_step``) own their own
+tracker read/write cycle, so they call the in-memory helpers instead of the functions
+above — same field semantics, one implementation:
+
+* ``arm_step_liveness`` — write the liveness fields onto a loaded step and stamp
+  ``spec_version`` on its tracker.
+* ``finalize_step_liveness`` — clear the owner and record the duration on a terminal step.
+* ``expected_completion_from`` — derive ``expected_completion_at`` from a start and a duration.
+* ``now_iso8601_utc`` — the one timestamp format every liveness value is written in. Callers
+  must use it rather than re-deriving the format, because these helpers parse what it writes.
+
 A subagent driving a long-running step must call ``write_heartbeat`` at least once per
 ``heartbeat_interval_seconds`` window or the liveness verificator will eventually flag the step
 as ghosted.
@@ -22,6 +33,8 @@ python -m arf.scripts.utils.heartbeat write <task_id> <step_number> <owner>
 python -m arf.scripts.utils.heartbeat start <task_id> <step_number> <owner> \
     --interval-seconds 300 --expected-completion-at 2026-05-20T12:00:00Z
 python -m arf.scripts.utils.heartbeat complete <task_id> <step_number>
+python -m arf.scripts.utils.heartbeat pause <task_id> <step_number> \
+    --resume-sentinel <what to re-check> --resume-after <ISO> --watchdog-active
 ```
 """
 
@@ -29,13 +42,12 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from arf.scripts.verificators.common import paths
 
 STATUS_FIELD: str = "status"
-STATUS_PENDING: str = "pending"
 STATUS_IN_PROGRESS: str = "in_progress"
 STATUS_COMPLETED: str = "completed"
 STATUS_PAUSED_WAITING: str = "paused_waiting"
@@ -44,6 +56,8 @@ RESUME_SENTINEL_FIELD: str = "resume_sentinel"
 PAUSED_AT_FIELD: str = "paused_at"
 RESUME_AFTER_FIELD: str = "resume_after"
 WATCHDOG_ACTIVE_FIELD: str = "watchdog_active"
+LIVENESS_PROBE_FIELD: str = "liveness_probe"
+PAUSE_COUNT_FIELD: str = "pause_count"
 
 STEPS_FIELD: str = "steps"
 STEP_FIELD: str = "step"
@@ -54,6 +68,20 @@ CURRENT_OWNER_FIELD: str = "current_owner"
 HEARTBEAT_INTERVAL_FIELD: str = "heartbeat_interval_seconds"
 EXPECTED_COMPLETION_FIELD: str = "expected_completion_at"
 ACTUAL_DURATION_FIELD: str = "actual_duration_seconds"
+SPEC_VERSION_FIELD: str = "spec_version"
+ISO8601_FORMAT: str = "%Y-%m-%dT%H:%M:%SZ"
+
+# Stamped on a tracker the first time a step is armed under this version, which is
+# what lifts it out of the v1 backward-compatibility carve-out in
+# verify_step_liveness. Keep in step with step_tracker_specification.md's version.
+STEP_TRACKER_SPEC_VERSION: str = "7"
+
+# Safety-net defaults for a caller that does not declare its own cadence. These are
+# deliberately looser than the cadence table in step_tracker_specification.md: the
+# table is a target for an owner that heartbeats, these are a detection floor for one
+# that does not. Stale is interval x 3, so silence is called dead after 90 minutes.
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS: int = 1800
+DEFAULT_EXPECTED_DURATION_SECONDS: int = 3600
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,9 +91,9 @@ class StepLocation:
     step: dict[str, object]
 
 
-def _now_iso8601_utc() -> str:
+def now_iso8601_utc() -> str:
     now: datetime = datetime.now(tz=UTC).replace(microsecond=0)
-    return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return now.strftime(ISO8601_FORMAT)
 
 
 def _parse_iso8601(*, value: str) -> datetime:
@@ -122,6 +150,63 @@ def _write_tracker(*, tracker_path: Path, tracker: dict[str, object]) -> None:
     tracker_path.write_text(rendered, encoding="utf-8")
 
 
+def expected_completion_from(
+    *,
+    started_at: str,
+    expected_duration_seconds: int,
+) -> str:
+    start: datetime = _parse_iso8601(value=started_at)
+    return (start + timedelta(seconds=expected_duration_seconds)).strftime(ISO8601_FORMAT)
+
+
+def arm_step_liveness(
+    *,
+    tracker: dict[str, object],
+    step: dict[str, object],
+    started_at: str,
+    current_owner: str,
+    heartbeat_interval_seconds: int,
+    expected_completion_at: str,
+) -> None:
+    """Write the liveness fields onto an in-memory step and stamp the tracker.
+
+    Operates on already-loaded structures so a caller that owns the read/write cycle
+    (``prestep``) shares one implementation with the standalone CLI, instead of the two
+    drifting apart. The caller persists the tracker.
+    """
+
+    step[CURRENT_OWNER_FIELD] = current_owner
+    step[LAST_HEARTBEAT_AT_FIELD] = started_at
+    step[HEARTBEAT_INTERVAL_FIELD] = heartbeat_interval_seconds
+    step[EXPECTED_COMPLETION_FIELD] = expected_completion_at
+    # setdefault, not assignment: an existing spec_version is the tracker's own and
+    # must survive: a mid-flight upgrade never rewrites history.
+    tracker.setdefault(SPEC_VERSION_FIELD, STEP_TRACKER_SPEC_VERSION)
+
+
+def finalize_step_liveness(
+    *,
+    step: dict[str, object],
+    completed_at: str,
+) -> None:
+    """Clear the owner and record the wall-clock duration on a step reaching a terminal state."""
+
+    step[CURRENT_OWNER_FIELD] = None
+    started_at_obj: object = step.get(STARTED_AT_FIELD)
+    if not isinstance(started_at_obj, str):
+        # No start timestamp means the duration was never measurable — say so with
+        # None rather than inventing a zero that reads like a real measurement.
+        step[ACTUAL_DURATION_FIELD] = None
+        return
+    elapsed: float = (
+        _parse_iso8601(value=completed_at) - _parse_iso8601(value=started_at_obj)
+    ).total_seconds()
+    # A negative elapsed means the tracker is corrupt (clock skew, hand edit,
+    # completed_at before started_at). Clamping it to 0 would launder that into a
+    # plausible "ran instantly"; None says the duration is not measurable.
+    step[ACTUAL_DURATION_FIELD] = int(elapsed) if elapsed >= 0 else None
+
+
 def start_step(
     *,
     task_id: str,
@@ -133,14 +218,18 @@ def start_step(
     """Transition a step from ``pending`` to ``in_progress`` and initialize liveness fields."""
 
     location: StepLocation = _locate(task_id=task_id, step_number=step_number)
-    now: str = _now_iso8601_utc()
+    now: str = now_iso8601_utc()
 
     location.step[STATUS_FIELD] = STATUS_IN_PROGRESS
     location.step[STARTED_AT_FIELD] = now
-    location.step[CURRENT_OWNER_FIELD] = current_owner
-    location.step[LAST_HEARTBEAT_AT_FIELD] = now
-    location.step[HEARTBEAT_INTERVAL_FIELD] = heartbeat_interval_seconds
-    location.step[EXPECTED_COMPLETION_FIELD] = expected_completion_at
+    arm_step_liveness(
+        tracker=location.tracker,
+        step=location.step,
+        started_at=now,
+        current_owner=current_owner,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        expected_completion_at=expected_completion_at,
+    )
 
     _write_tracker(tracker_path=location.tracker_path, tracker=location.tracker)
 
@@ -154,7 +243,7 @@ def write_heartbeat(
     """Refresh ``last_heartbeat_at`` and ``current_owner`` on a step that is already in progress."""
 
     location: StepLocation = _locate(task_id=task_id, step_number=step_number)
-    location.step[LAST_HEARTBEAT_AT_FIELD] = _now_iso8601_utc()
+    location.step[LAST_HEARTBEAT_AT_FIELD] = now_iso8601_utc()
     location.step[CURRENT_OWNER_FIELD] = current_owner
 
     _write_tracker(tracker_path=location.tracker_path, tracker=location.tracker)
@@ -164,21 +253,22 @@ def complete_step(*, task_id: str, step_number: int) -> None:
     """Transition a step to ``completed``, compute duration, and clear ``current_owner``."""
 
     location: StepLocation = _locate(task_id=task_id, step_number=step_number)
-    now: str = _now_iso8601_utc()
-
-    started_at_obj: object = location.step.get(STARTED_AT_FIELD)
-    duration_seconds: int = 0
-    if isinstance(started_at_obj, str):
-        started_dt: datetime = _parse_iso8601(value=started_at_obj)
-        completed_dt: datetime = _parse_iso8601(value=now)
-        duration_seconds = max(0, int((completed_dt - started_dt).total_seconds()))
+    now: str = now_iso8601_utc()
 
     location.step[STATUS_FIELD] = STATUS_COMPLETED
     location.step[COMPLETED_AT_FIELD] = now
-    location.step[ACTUAL_DURATION_FIELD] = duration_seconds
-    location.step[CURRENT_OWNER_FIELD] = None
+    finalize_step_liveness(step=location.step, completed_at=now)
 
     _write_tracker(tracker_path=location.tracker_path, tracker=location.tracker)
+
+
+def _next_pause_count(*, step: dict[str, object]) -> int:
+    previous: object = step.get(PAUSE_COUNT_FIELD)
+    if isinstance(previous, int) and not isinstance(previous, bool):
+        return previous + 1
+    # A missing or malformed count means this is the first countable pause. Refusing to
+    # count would disable ST-E010 on exactly the trackers most likely to be hand-edited.
+    return 1
 
 
 def pause_step(
@@ -188,6 +278,7 @@ def pause_step(
     resume_sentinel: str,
     resume_after: str,
     watchdog_active: bool,
+    liveness_probe: str | None,
 ) -> None:
     """Transition an ``in_progress`` step to ``paused_waiting`` for a long external wait.
 
@@ -197,6 +288,13 @@ def pause_step(
     is ``True`` — otherwise a missed resume would leave the box billing (the banned fire-and-forget
     pattern, ``LESSONS.md`` Lesson 8). ``current_owner`` is cleared because no one is driving the
     step while paused; ``verify_step_liveness`` treats ``paused_waiting`` as a non-ghost state.
+
+    ``liveness_probe`` is a shell command that exits ``0`` while the remote work is still
+    running; ``arf/scripts/utils/resume_check.py`` runs it at resume so a job that died
+    mid-wait is distinguishable from one still going. It has no default because a caller
+    that has not thought about the dead-job branch should have to say so out loud —
+    passing ``None`` is allowed and flagged ``ST-W009``. ``pause_count`` increments on
+    every pause, so a wait that never converges trips ``ST-E010`` even without a probe.
     """
 
     assert watchdog_active, (
@@ -208,9 +306,17 @@ def pause_step(
     location.step[STATUS_FIELD] = STATUS_PAUSED_WAITING
     location.step[CURRENT_OWNER_FIELD] = None
     location.step[RESUME_SENTINEL_FIELD] = resume_sentinel
-    location.step[PAUSED_AT_FIELD] = _now_iso8601_utc()
+    location.step[PAUSED_AT_FIELD] = now_iso8601_utc()
     location.step[RESUME_AFTER_FIELD] = resume_after
     location.step[WATCHDOG_ACTIVE_FIELD] = watchdog_active
+    # Normalize at the writer: the spec types this field `string | null`, and `""` on
+    # disk would make every reader re-derive "is there a probe" for itself.
+    location.step[LIVENESS_PROBE_FIELD] = (
+        liveness_probe.strip()
+        if liveness_probe is not None and len(liveness_probe.strip()) > 0
+        else None
+    )
+    location.step[PAUSE_COUNT_FIELD] = _next_pause_count(step=location.step)
 
     _write_tracker(tracker_path=location.tracker_path, tracker=location.tracker)
 
@@ -271,6 +377,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Assert the VM carries an idle dead-man's-switch watchdog. Required to pause safely.",
     )
+    pause_p.add_argument(
+        "--liveness-probe",
+        type=str,
+        default=None,
+        help=(
+            "Shell command that exits 0 while the remote work is still running "
+            "(e.g. 'ssh HOST tmux has-session -t train'). Without it a dead job is "
+            "indistinguishable from a slow one and the step re-pauses forever."
+        ),
+    )
 
     return parser
 
@@ -310,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
             resume_sentinel=args.resume_sentinel,
             resume_after=args.resume_after,
             watchdog_active=args.watchdog_active,
+            liveness_probe=args.liveness_probe,
         )
     else:
         parser.error(f"unknown action: {args.action}")

@@ -25,10 +25,16 @@ import argparse
 import json
 import subprocess
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from arf.scripts.utils.heartbeat import (
+    DEFAULT_EXPECTED_DURATION_SECONDS,
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    arm_step_liveness,
+    expected_completion_from,
+    now_iso8601_utc,
+)
 from arf.scripts.verificators.common.paths import (
     TASKS_DIR,
     step_folder_path,
@@ -199,7 +205,21 @@ def _create_minimal_tracker(*, task_id: str) -> dict[str, Any]:
     return tracker
 
 
-def run_prestep(*, task_id: str, step_id: str) -> int:
+DEFAULT_OWNER_PREFIX: str = "step-executor/"
+
+
+def _default_owner(*, step_id: str) -> str:
+    return f"{DEFAULT_OWNER_PREFIX}{step_id}"
+
+
+def run_prestep(
+    *,
+    task_id: str,
+    step_id: str,
+    current_owner: str | None = None,
+    heartbeat_interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    expected_duration_seconds: int = DEFAULT_EXPECTED_DURATION_SECONDS,
+) -> int:
     repo_root: Path = _detect_repo_root()
 
     # Load tracker (auto-create for create-branch if missing)
@@ -299,7 +319,7 @@ def run_prestep(*, task_id: str, step_id: str) -> int:
     _info(f"Created step folder: {folder.relative_to(TASKS_DIR.parent)}")
 
     # Mark step as in_progress
-    now: str = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now: str = now_iso8601_utc()
     step[FIELD_STATUS] = STATUS_IN_PROGRESS
     step[FIELD_STARTED_AT] = now
     step[FIELD_LOG_FILE] = (
@@ -307,6 +327,21 @@ def run_prestep(*, task_id: str, step_id: str) -> int:
             folder.relative_to(TASKS_DIR / task_id),
         )
         + "/"
+    )
+    # Arm liveness here, not in the step's own code. A step is monitorable from the
+    # moment it starts, whether or not its owner ever heartbeats again — a contract
+    # that relies on every executor remembering to call an API is not in force.
+    owner: str = current_owner if current_owner is not None else _default_owner(step_id=step_id)
+    arm_step_liveness(
+        tracker=tracker,
+        step=step,
+        started_at=now,
+        current_owner=owner,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        expected_completion_at=expected_completion_from(
+            started_at=now,
+            expected_duration_seconds=expected_duration_seconds,
+        ),
     )
     _save_tracker(task_id=task_id, data=tracker)
     _info(f"Step '{step_id}' is now in_progress (started_at: {now})")
@@ -326,9 +361,34 @@ def main() -> None:
         "step_id",
         help="Step ID (e.g. research-papers, implementation)",
     )
+    parser.add_argument(
+        "--current-owner",
+        default=None,
+        help="Identifier of the agent driving this step (default: step-executor/<step_id>)",
+    )
+    parser.add_argument(
+        "--heartbeat-interval-seconds",
+        type=int,
+        default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        help="Promised heartbeat cadence; stale is this x 3",
+    )
+    parser.add_argument(
+        "--expected-duration-seconds",
+        type=int,
+        default=DEFAULT_EXPECTED_DURATION_SECONDS,
+        help="Best-effort expected wall-clock duration, used for expected_completion_at",
+    )
     args: argparse.Namespace = parser.parse_args()
 
-    sys.exit(run_prestep(task_id=args.task_id, step_id=args.step_id))
+    sys.exit(
+        run_prestep(
+            task_id=args.task_id,
+            step_id=args.step_id,
+            current_owner=args.current_owner,
+            heartbeat_interval_seconds=args.heartbeat_interval_seconds,
+            expected_duration_seconds=args.expected_duration_seconds,
+        ),
+    )
 
 
 if __name__ == "__main__":

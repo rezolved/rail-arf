@@ -67,6 +67,18 @@ EXIT_OK: int = 0
 EXIT_GENERIC_ERROR: int = 1
 EXIT_POOL_BUSY: int = 75  # matches sysexits.h EX_TEMPFAIL
 
+# VM-side guarantees checked before the task lock is placed. See the script header
+# and LESSONS.md Lessons 10 (persistent storage) and 11 (systemd lingering).
+PREFLIGHT_SCRIPT_PATH: Path = Path(__file__).resolve().parent / "remote_preflight.sh"
+PREFLIGHT_FAILURE_PHASE: str = "preflight"
+PREFLIGHT_TIMEOUT_SECONDS: float = 120.0
+# The wire format the script prints. Kept as literals here and in the script rather
+# than shared through a constant neither side can see, so a rename on one side shows
+# up as a failure instead of staying self-consistently green.
+PREFLIGHT_LINGER_ENABLED_KEY: str = "linger_enabled"
+PREFLIGHT_PERSIST_PATH_KEY: str = "persist_path"
+PREFLIGHT_PERSIST_WRITABLE_KEY: str = "persist_writable"
+
 # Azure compute instance states we care about, normalized to lowercase.
 _STATE_RUNNING: str = "running"
 _STATE_STOPPED: str = "stopped"
@@ -236,6 +248,93 @@ def _run_ssh(
         stdout=proc.stdout,
         stderr=proc.stderr,
     )
+
+
+# ---------------------------------------------------------------------------
+# VM-side preflight guarantees
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PreflightResult:
+    linger_enabled: bool
+    persist_path: str
+    persist_writable: bool
+
+
+def _parse_preflight_stdout(*, stdout: str) -> PreflightResult | None:
+    # The script prints one JSON line, but a login shell may print a banner or a
+    # motd first, so scan for the line that parses rather than assuming position.
+    for line in stdout.splitlines():
+        stripped: str = line.strip()
+        if len(stripped) == 0:
+            continue
+        try:
+            payload: object = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        linger: object = payload.get(PREFLIGHT_LINGER_ENABLED_KEY)
+        persist_path: object = payload.get(PREFLIGHT_PERSIST_PATH_KEY)
+        writable: object = payload.get(PREFLIGHT_PERSIST_WRITABLE_KEY)
+        if not isinstance(linger, bool):
+            continue
+        if not isinstance(persist_path, str):
+            continue
+        if not isinstance(writable, bool):
+            continue
+        return PreflightResult(
+            linger_enabled=linger,
+            persist_path=persist_path,
+            persist_writable=writable,
+        )
+    return None
+
+
+def run_remote_preflight(*, vm: VmPoolEntry) -> PreflightResult | None:
+    """Run the VM-side guarantees on ``vm``; ``None`` means the box must not be used.
+
+    Ships ``remote_preflight.sh`` as the SSH command itself, so nothing has to be
+    staged on the box first. A ``None`` here is not a warning to log and continue
+    past: the two guarantees it checks are the ones whose absence destroys a
+    training run silently (``LESSONS.md`` Lessons 10 and 11).
+    """
+
+    # A sibling data file, not an import: nothing fails at build time if it is renamed,
+    # and an uncaught read error here would abort the whole pool instead of one VM.
+    assert PREFLIGHT_SCRIPT_PATH.is_file(), f"preflight script exists at {PREFLIGHT_SCRIPT_PATH}"
+    script: str = PREFLIGHT_SCRIPT_PATH.read_text(encoding="utf-8")
+    try:
+        result: CommandResult = _run_ssh(
+            host_alias=vm.ssh_host_alias,
+            remote_command=script,
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(
+            f"preflight on {vm.name} timed out after {PREFLIGHT_TIMEOUT_SECONDS:.0f}s\n",
+        )
+        return None
+    if result.returncode != 0:
+        # The script names which guarantee failed, on which path, for which user. Put it
+        # where run_with_logs will capture it — the FailedAttempt recorded upstream can
+        # only say that preflight failed, not why.
+        sys.stderr.write(f"preflight failed on {vm.name}: {result.stderr.strip()}\n")
+        return None
+    parsed: PreflightResult | None = _parse_preflight_stdout(stdout=result.stdout)
+    if parsed is None:
+        return None
+    # Enforce the guarantees on this side too, rather than trusting the exit code to
+    # agree with the payload. A detector that reads fields nothing ever varies is how the
+    # first liveness bug survived for months (LESSONS Lesson 8, first follow-up).
+    if not parsed.linger_enabled or not parsed.persist_writable:
+        sys.stderr.write(
+            f"preflight on {vm.name} reported linger_enabled={parsed.linger_enabled} "
+            f"persist_writable={parsed.persist_writable}\n",
+        )
+        return None
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +634,30 @@ def _try_acquire_one(
                 failure_phase="lock_held",
                 duration_seconds=_now_monotonic() - attempt_start,
                 wasted_cost_usd=0.0,
+                timestamp=timestamp,
+            ),
+            started_vm,
+        )
+
+    # Before the lock, not after: a locked VM is one this task is committed to, and
+    # a box that fails preflight is one whose training job dies on disconnect or
+    # whose checkpoints land on an ephemeral disk. Failing here lets the pool loop
+    # fall through to the next entry instead of stranding the task on it.
+    if run_remote_preflight(vm=vm) is None:
+        return (
+            False,
+            FailedAttempt(
+                vm_name=vm.name,
+                failure_reason=(
+                    f"VM {vm.name} failed remote preflight (systemd lingering or the "
+                    f"persistent-storage mount); see the step log for the script's stderr"
+                ),
+                failure_phase=PREFLIGHT_FAILURE_PHASE,
+                duration_seconds=_now_monotonic() - attempt_start,
+                wasted_cost_usd=_estimate_wasted_cost(
+                    hourly=vm.hourly_cost_usd,
+                    seconds=_now_monotonic() - attempt_start,
+                ),
                 timestamp=timestamp,
             ),
             started_vm,

@@ -19,9 +19,9 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 
+from arf.scripts.utils.heartbeat import finalize_step_liveness, now_iso8601_utc
 from arf.scripts.verificators.common.paths import (
     TASKS_DIR,
     step_tracker_path,
@@ -172,7 +172,7 @@ def skip_steps(
     steps: list[dict[str, object]] = [s for s in raw_steps if isinstance(s, dict)]
 
     task_dir: Path = TASKS_DIR / task_id
-    timestamp: str = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp: str = now_iso8601_utc()
     results: list[SkipResult] = []
 
     for req in requests:
@@ -223,6 +223,10 @@ def skip_steps(
             log_file.write_text(step_log_content, encoding="utf-8")
 
         step[FIELD_STATUS] = STATUS_SKIPPED
+        # started_at stays null: the step never ran, so finalize records a null
+        # duration rather than a zero. completed_at is when it was decided.
+        step[FIELD_COMPLETED_AT] = timestamp
+        finalize_step_liveness(step=step, completed_at=timestamp)
 
         log_rel: str = f"logs/steps/{log_dir_name}/"
         step[FIELD_LOG_FILE] = log_rel

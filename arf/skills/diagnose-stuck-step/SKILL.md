@@ -9,7 +9,7 @@ description: >-
 ---
 # Diagnose Stuck Step
 
-**Version**: 1
+**Version**: 3
 
 ## Goal
 
@@ -56,9 +56,10 @@ Read before starting:
    skill's report.
 4. **Heartbeat discipline applies to this skill too**. Before doing any probe, call
    `arf.scripts.utils.heartbeat.start_step` for the step that owns this diagnostic invocation
-   (typically a sub-step under the parent task) with `heartbeat_interval_seconds=60` and
-   `expected_completion_at` five minutes in the future. If a probe runs long, refresh the heartbeat
-   between probes.
+   (typically a sub-step under the parent task). All five arguments are keyword-only and required:
+   `task_id`, `step_number`, `current_owner` (use `"diagnose-stuck-step"`),
+   `heartbeat_interval_seconds=60`, and `expected_completion_at` five minutes in the future. If a
+   probe runs long, refresh the heartbeat between probes.
 5. **Output exactly one report file**. The skill always writes
    `tasks/$TASK_ID/logs/diagnostics/<timestamp>_<step_number>.json`. On any internal failure, the
    report still gets written with `engine_state = "unknown"` and the failure mode captured in
@@ -74,22 +75,35 @@ Read before starting:
    `$STEP_NUMBER`. If the step is missing, write a report with `engine_state = "unknown"`,
    `likely_cause = "step <N> not present in step_tracker.json"`,
    `recommended_action = "intervention_required"`, and exit.
+
 2. Capture from the step: `status`, `started_at`, `last_heartbeat_at`, `expected_completion_at`,
    `heartbeat_interval_seconds`, `current_owner`, `log_file`.
+
 3. If `status != "in_progress"`, the step is not in fact stuck. Write a report with
    `recommended_action = "intervention_required"` and a `likely_cause` noting the unexpected status.
    The orchestrator should not have routed here.
+
+   A `paused_waiting` step is the common wrong routing. Pauses are diagnosed by
+   `arf/scripts/utils/resume_check.py`, which runs the step's recorded `liveness_probe` and reports
+   whether the remote job is alive or dead — say so in `likely_cause` so the caller re-routes
+   instead of concluding the step is fine. `ST-E010` (a step that has re-paused past the cap) and
+   `ST-W009` (a pause with no probe) both belong to that path, not to this skill.
 
 ### Step 2: Resolve VM coordinates (if any)
 
 1. Glob `tasks/$TASK_ID/logs/steps/*setup-machines*/machine_log.json`. If no file exists, the task
    has no VM — proceed to Step 3 with `vm_present = False`.
-2. Otherwise, parse the file (a JSON array of machine objects). The first entry with
-   `actual_status == "running"` is the active VM. Capture `ssh_host`, `ssh_port`, `ssh_user`
-   (default to `azureuser` when not present), and any engine URL recorded in `machine_log.json`
-   (look for a top-level `engine_url`, or fall back to constructing `http://<ssh_host>:8000` only
-   when the engine has been previously confirmed up — otherwise leave it `None`).
-3. If no `running` entry exists, `vm_present = False`.
+2. Otherwise, parse the file (a JSON array of machine objects). The active VM is the first entry
+   with a non-empty `instance_id` and no `destroyed_at` — the live-VM definition in
+   `arf/specifications/step_tracker_specification.md`. Do NOT match on a provider status field such
+   as `actual_status`: that describes a live provider API response and is never persisted into
+   `machine_log.json`, so matching on it marks every task as having no VM and skips the probe
+   entirely — on exactly the billing machines this skill exists to catch. Capture `ssh_host`,
+   `ssh_port`, `ssh_user` (default to `azureuser` when not present), and any engine URL recorded in
+   `machine_log.json` (look for a top-level `engine_url`, or fall back to constructing
+   `http://<ssh_host>:8000` only when the engine has been previously confirmed up — otherwise leave
+   it `None`).
+3. Only when every entry carries a `destroyed_at` is `vm_present = False`.
 
 ### Step 3: Run the read-only probe (VM case)
 
