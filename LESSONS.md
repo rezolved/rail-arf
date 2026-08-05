@@ -1,23 +1,25 @@
 # Rezolve ARF Lessons
 
-**Version**: 10
+**Version**: 11
 
-A curated index of generalizable lessons accumulated from Rezolve research projects that have been
-run on this framework. Each lesson lists: *what went wrong*, *why*, and *how the framework now
-mitigates it*. Lessons are referenced from individual skills and verificators so a new project
-inherits them by construction.
+A curated index of portable lessons accumulated from Rezolve research projects that have been run on
+this framework. Each lesson lists: *what went wrong*, *why*, and *how the framework now mitigates
+it*. Lessons are referenced from individual skills and verificators so a new project inherits them
+by construction.
 
 Read this file before planning a task involving latency benchmarks, GPU provisioning, or
 paired-bootstrap analysis.
 
-This is the fork-base. A lesson belongs here only if the thing that enforces it also ships here — a
-skill, a spec, a verificator, a script. Lessons whose enforcement lives in one project's own `meta/`
-or `tasks/` belong in that project's `LESSONS.md`, not in the template, because a fork that never
-does that kind of work inherits a rule with nothing behind it.
+This file is the portable half. A lesson belongs here only if the thing that enforces it ships in
+the ARF fork-base — a skill, a spec, a verificator, a script. Lessons whose enforcement lives in one
+project's own `meta/`, `tasks/`, or `project/` belong in that project's `project/LESSONS.md`, which
+exists only in project forks. This file ports between repositories verbatim; that one never does.
 
-**Lesson numbers are identifiers, not positions.** Over thirty references across skills, specs,
-verificators, and scripts cite lessons by number. Never renumber; a removed lesson leaves a gap.
-Gaps at 6, 7, and 9 are project-specific lessons that live in `rail-arf-finetuning`.
+**Lesson numbers are globally unique across both files and are never reused or renumbered.** Over
+1500 references in completed task folders cite lessons by number, and completed task folders are
+immutable. A number therefore means one thing forever, in either file, in either repository. A gap
+here is a lesson that lives in `project/LESSONS.md`. New lessons take the next unused number
+regardless of which file they land in.
 
 * * *
 
@@ -357,16 +359,14 @@ completely normal (no error) right up to the kill.
 
 ## Adding new lessons
 
-When a Rezolve research project produces a generalizable lesson:
-
-1. Decide where it belongs. If the thing that enforces it ships in this repo, the lesson goes here.
-   If the enforcement lives in one project's own `meta/` or `tasks/`, the lesson goes in that
-   project's `LESSONS.md`. Write it down once, in the repo that can act on it.
-2. Add a new `## Lesson N: <one-line headline>` section, taking the next unused number. Never reuse
-   a gap and never renumber — the numbers are cited from code.
+1. Decide which file the lesson belongs in. If the thing that enforces it ships in the ARF
+   fork-base, it goes here. If enforcement lives in a project's own `meta/`, `tasks/`, or
+   `project/`, it goes in that project's `project/LESSONS.md`.
+2. Take the next unused number across **both** files. Never reuse a gap, never renumber — the
+   numbers are cited from code and from immutable task folders.
 3. Use the four-part structure: *What went wrong* (with task/project reference), *Why*, *Mitigation
    in the framework*.
-4. Implement the mitigation as a default in the relevant skill, asset spec, or verificator. A lesson
-   without a corresponding default is just a complaint. Name the enforcing file by path, so the
-   claim can be checked rather than believed.
+4. Implement the mitigation as a default in the relevant skill, asset spec, or verificator, and name
+   the enforcing file by path so the claim can be checked rather than believed. A lesson without a
+   corresponding default is just a complaint.
 5. Increment the file's `**Version**` line at the top.

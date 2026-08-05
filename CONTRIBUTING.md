@@ -11,8 +11,8 @@ freely; these are Rezolve's now.
 gh repo fork rezolved/rail-arf --org rezolved --fork-name rail-arf-<project-slug>
 ```
 
-Then run `/setup-project` in Claude Code to populate `project/description.md`, `project/budget.json`,
-and the project's `meta/` entries.
+Then run `/setup-project` in Claude Code to populate `project/description.md`,
+`project/budget.json`, and the project's `meta/` entries.
 
 ## Modifying the framework
 
@@ -24,10 +24,21 @@ specification you change (plain integer, +1 per change — see
 
 ## Adding a lesson
 
-When a Rezolve research project produces a generalizable lesson, follow the procedure at the bottom
-of `LESSONS.md`: add a `## Lesson N` entry with *what went wrong*, *why*, *mitigation*, and wire
-the mitigation as a default in the relevant skill, asset spec, or verificator. A lesson without a
-corresponding code default is a complaint, not a lesson.
+Lessons live in two files. `LESSONS.md` holds portable ones — those whose enforcement ships in this
+fork-base — and is copied into forks verbatim. A fork's own lessons go in its `project/LESSONS.md`,
+which never comes back here. Decide which applies before writing, because a lesson in the wrong file
+either gets lost on the next port or arrives in a fork that has nothing to enforce it.
+
+Follow the procedure at the bottom of whichever file applies: add a `## Lesson N` entry with *what
+went wrong*, *why*, *mitigation*, and wire the mitigation as a default in the relevant skill, asset
+spec, or verificator. A lesson without a corresponding code default is a complaint, not a lesson —
+if you record one anyway, say so explicitly rather than letting it read as a guarantee.
+
+**Lesson numbers are globally unique across both files and are never reused or renumbered.** They
+are cited from skills, specifications, and scripts here, and from immutable completed task folders
+in every fork. Take the next unused number across both files; a gap is a lesson that lives in the
+other one. `arf/tests/test_lesson_references_resolve.py` fails if a citation in `arf/` or `meta/`
+points at a lesson that does not exist.
 
 ## Development setup
 
