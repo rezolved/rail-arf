@@ -74,7 +74,7 @@ ISO8601_FORMAT: str = "%Y-%m-%dT%H:%M:%SZ"
 # Stamped on a tracker the first time a step is armed under this version, which is
 # what lifts it out of the v1 backward-compatibility carve-out in
 # verify_step_liveness. Keep in step with step_tracker_specification.md's version.
-STEP_TRACKER_SPEC_VERSION: str = "5"
+STEP_TRACKER_SPEC_VERSION: str = "7"
 
 # Safety-net defaults for a caller that does not declare its own cadence. These are
 # deliberately looser than the cadence table in step_tracker_specification.md: the

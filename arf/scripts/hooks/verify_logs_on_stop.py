@@ -142,7 +142,11 @@ def find_unattended_steps(*, tasks_dir: Path) -> list[UnattendedStep]:
             unattended.append(
                 UnattendedStep(
                     task_id=task_dir.name,
-                    step_number=step_number if isinstance(step_number, int) else None,
+                    step_number=(
+                        step_number
+                        if isinstance(step_number, int) and not isinstance(step_number, bool)
+                        else None
+                    ),
                     step_name=step_name if isinstance(step_name, str) else None,
                 ),
             )

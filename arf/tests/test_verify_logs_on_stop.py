@@ -200,3 +200,37 @@ def test_missing_hook_payload_is_treated_as_a_first_block(
         hook_module.main()
 
     assert exit_info.value.code == BLOCK_EXIT_CODE, "an unreadable payload still blocks"
+
+
+def test_a_boolean_step_number_is_reported_as_unknown_not_as_a_number(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``isinstance(True, int)`` is true, so a bool sneaks past a bare int check.
+
+    The block message exists to point an operator at a specific step. A tracker whose
+    ``step`` is ``true`` would render as ``step True`` — a step number that does not
+    exist, offered with the same confidence as a real one. Reporting it as unknown is
+    honest; the guard still blocks, because the step is still unattended.
+    """
+    _prepare_repo(
+        monkeypatch=monkeypatch,
+        repo_root=tmp_path,
+        step_status=STATUS_IN_PROGRESS,
+        task_status=STATUS_IN_PROGRESS,
+    )
+    build_step_tracker(
+        repo_root=tmp_path,
+        task_id=TASK_ID,
+        steps=[{**_build_step(status=STATUS_IN_PROGRESS), STEP_FIELD: True}],
+    )
+    _set_hook_stdin(monkeypatch=monkeypatch, stop_hook_active=False)
+
+    with pytest.raises(SystemExit) as exit_info:
+        hook_module.main()
+
+    assert exit_info.value.code == BLOCK_EXIT_CODE, "a malformed step still blocks the stop"
+    stderr: str = capsys.readouterr().err
+    assert "step True" not in stderr, "a bool is never presented as a step number"
+    assert "step ?" in stderr, "an unusable step number is reported as unknown"

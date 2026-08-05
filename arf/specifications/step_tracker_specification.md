@@ -40,7 +40,7 @@ One file per task. Created when the task starts; updated as each step progresses
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `spec_version` | string | yes | Specification version (e.g., `"6"`) |
+| `spec_version` | string | yes | Specification version (e.g., `"7"`) |
 | `task_id` | string | yes | Must match the task folder name |
 | `steps` | list[Step] | yes | Ordered list of task steps |
 
@@ -261,7 +261,7 @@ tuned for the unknown case.
 
 ```json
 {
-  "spec_version": "6",
+  "spec_version": "7",
   "task_id": "0008-baseline-sentiment-classifier",
   "steps": [
     {

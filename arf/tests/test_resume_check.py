@@ -14,8 +14,6 @@ branch that applies:
 * probe times out → ``job_alive`` (exit 0), because a hung SSH is not evidence of death
 
 A step that is not ``paused_waiting`` is an error (exit 1).
-
-The module does not exist yet; these tests fail with an import error.
 """
 
 import json

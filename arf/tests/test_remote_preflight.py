@@ -11,8 +11,6 @@ Two layers are covered here:
 * ``arf.scripts.utils.azure_ml_vm.run_remote_preflight`` — ships that script to the VM
   through the module's ``_run_ssh`` shim and parses its single JSON line, plus the
   ``acquire`` wiring that refuses to lock a VM whose preflight did not pass.
-
-Neither exists yet; these tests fail until they do.
 """
 
 import json
