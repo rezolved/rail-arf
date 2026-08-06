@@ -1,20 +1,21 @@
 # rail-arf — Rezolve's Canonical ARF Fork
 
-Template repository for starting a Rezolve research project (latency, fine-tuning, RAG,
-guardrails, etc.) using the Glite Autonomous Research Framework. Fork this repo and replace this
-section with your project-specific description.
+Template repository for starting a Rezolve research project (latency, fine-tuning, RAG, guardrails,
+etc.) using the Glite Autonomous Research Framework. Fork this repo and replace this section with
+your project-specific description.
 
-This started as a fork of the Glite ARF template but is developed independently by Rezolve. On
-top of the base framework it adds:
+This started as a fork of the Glite ARF template but is developed independently by Rezolve. On top
+of the base framework it adds:
 
 * An Azure ML SSH-VM provisioner (`arf/scripts/utils/azure_ml_vm.py`) wired into the
   `setup-remote-machine` skill — Azure ML is the default GPU provider for Rezolve projects.
-* A statistically-significant paired-bootstrap library (`arf/scripts/stats/bootstrap_compare/`)
-  with locked seeds, used for any cross-condition comparison.
+* A statistically-significant paired-bootstrap library (`arf/scripts/stats/bootstrap_compare/`) with
+  locked seeds, used for any cross-condition comparison.
 * A warmup-protocol shape (`arf/scripts/protocols/warmup_runner/`) — engine-agnostic constants and
   spec for the warmup-N + measured-M latency-benchmark pattern.
 * A `LESSONS.md` at the repo root capturing hard-won lessons from prior Rezolve research projects,
-  encoded as defaults in skills and verificators.
+  encoded as defaults in skills and verificators. It holds only portable lessons — ones whose
+  enforcement ships here. A fork records its own in `project/LESSONS.md`, which never ports back.
 
 ## Commands
 
@@ -41,7 +42,7 @@ uv run pytest                                        # Run framework tests in ar
 * Project description and goals: create `project/description.md` in your fork
 * New project onboarding: @arf/skills/setup-project/SKILL.md
 * ARF architecture and glossary: @arf/README.md
-* Rezolve-specific lessons accumulated over prior projects: @LESSONS.md
+* Portable ARF lessons accumulated over prior projects: @LESSONS.md
 * Python style guide: @arf/styleguide/python_styleguide.md
 * Markdown style guide: @arf/styleguide/markdown_styleguide.md
 * Agent instructions style guide: @arf/styleguide/agent_instructions_styleguide.md
@@ -78,9 +79,11 @@ uv run pytest                                        # Run framework tests in ar
    predictions, costs, metrics, or metric results. Aggregators in `arf/scripts/aggregators/` apply
    the corrections overlay; raw filesystem walks silently miss corrections and produce stale
    answers. See `arf/docs/reference/aggregators.md` for the full list and flags.
-10. Read `LESSONS.md` before planning a task that involves latency benchmarks, GPU provisioning,
-    quantization, or paired-bootstrap analysis. Each lesson lists the mitigation already wired into
-    the framework and the verificator that enforces it.
+10. Read `LESSONS.md` — and a fork's `project/LESSONS.md` if it has one — before planning a task
+    that involves latency benchmarks, GPU provisioning, quantization, or paired-bootstrap analysis.
+    Each lesson lists the mitigation already wired into the framework and the verificator that
+    enforces it. Lesson numbers are globally unique across the two files and are never reused or
+    renumbered.
 
 ## Task Workflow
 
