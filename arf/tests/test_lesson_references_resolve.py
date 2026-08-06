@@ -28,7 +28,25 @@ SCANNED_DIRECTORIES: list[str] = ["arf", "meta"]
 SCANNED_SUFFIXES: tuple[str, ...] = (".py", ".md", ".sh")
 
 LESSON_HEADING_PATTERN = re.compile(r"^## Lesson (\d+):", re.MULTILINE)
-LESSON_CITATION_PATTERN = re.compile(r"\bLessons?\s+(\d+)(?:\s+and\s+(\d+))?")
+LESSON_CITATION_PATTERN = re.compile(r"\bLessons?\s+(\d+)")
+
+# A citation may chain further numbers with "and", and a short parenthetical may sit
+# between them: "Lessons 10 (persistent storage) and 11 (systemd lingering)". Matching
+# only "<n> and <m>" silently drops the second number in that form, which is the exact
+# blind spot this checker exists to prevent. The parenthetical is bounded and may not
+# span lines, so the scan cannot run on into unrelated prose.
+LESSON_CHAIN_PATTERN = re.compile(r"(?:\s*\([^)\n]{0,60}\))?\s+and\s+(\d+)\b")
+
+
+def cited_lesson_numbers(*, text: str) -> list[str]:
+    numbers: list[str] = []
+    for citation in LESSON_CITATION_PATTERN.finditer(text):
+        numbers.append(citation.group(1))
+        position: int = citation.end()
+        while (chained := LESSON_CHAIN_PATTERN.match(text, position)) is not None:
+            numbers.append(chained.group(1))
+            position = chained.end()
+    return numbers
 
 
 def _defined_lesson_numbers() -> set[str]:
@@ -70,13 +88,42 @@ def test_every_cited_lesson_exists() -> None:
             if not path.is_file() or path.suffix not in SCANNED_SUFFIXES:
                 continue
             text: str = path.read_text(encoding="utf-8", errors="replace")
-            for first, second in LESSON_CITATION_PATTERN.findall(text):
-                for number in (first, second):
-                    if number != "" and number not in defined:
-                        rel: str = str(path.relative_to(REPO_ROOT))
-                        dangling.append(f"{rel} cites Lesson {number}")
+            for number in cited_lesson_numbers(text=text):
+                if number not in defined:
+                    rel: str = str(path.relative_to(REPO_ROOT))
+                    dangling.append(f"{rel} cites Lesson {number}")
 
     assert len(dangling) == 0, (
         "these citations point at a lesson that does not exist in LESSONS.md or "
         "project/LESSONS.md:\n  " + "\n  ".join(sorted(set(dangling)))
     )
+
+
+def test_citation_parser_reads_every_number_in_a_chained_citation() -> None:
+    """A parenthetical between two chained numbers must not hide the second one.
+
+    Every string below is a real citation form from this repo. The middle one is the
+    case that a ``<n> and <m>`` pattern drops: ``LESSONS.md Lessons 10 (persistent
+    storage) and 11 (systemd lingering)`` yields only ``10``, so a checker built on it
+    would pass while Lesson 11 went undefined.
+    """
+    assert cited_lesson_numbers(text="see LESSONS.md Lesson 8 for the rationale") == ["8"]
+    assert cited_lesson_numbers(text="LESSONS.md Lessons 10 and 11).") == ["10", "11"]
+    assert cited_lesson_numbers(
+        text="LESSONS.md Lessons 10 (persistent storage) and 11 (systemd lingering).",
+    ) == ["10", "11"]
+
+
+def test_citation_parser_does_not_swallow_unrelated_numbers() -> None:
+    """The chain stops at the first thing that is not ``and <number>``.
+
+    A scan that merely collected digits near the word "Lesson" would read a date or an
+    adjacent clause as a lesson number and report a dangling citation that is not one —
+    a checker that cries wolf gets switched off.
+    """
+    assert cited_lesson_numbers(
+        text="Lessons 11 and 10 — a killed job and a lost adapter — and both are cheap",
+    ) == ["11", "10"]
+    assert cited_lesson_numbers(text="Lesson 8's fourth follow-up (2026-07-31) explains") == ["8"]
+    assert cited_lesson_numbers(text="## Lessons Learned\n\n3 items") == []
+    assert cited_lesson_numbers(text="Lesson 3 applies. Section 7 does not.") == ["3"]
