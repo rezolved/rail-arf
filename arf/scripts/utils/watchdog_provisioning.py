@@ -36,6 +36,11 @@ WATCHDOG_REMOTE_PATH: str = "/opt/arf/idle_watchdog.sh"
 WATCHDOG_REMOTE_DIR: str = str(PurePosixPath(WATCHDOG_REMOTE_PATH).parent)
 WATCHDOG_REMOTE_NAME: str = PurePosixPath(WATCHDOG_REMOTE_PATH).name
 WATCHDOG_BOOT_LOG: str = "/var/log/arf_idle_watchdog.boot.log"
+# Mirrors idle_watchdog.sh's own WATCHDOG_LOG default. Independent literal by
+# necessity (the install script only sets IDLE_THRESHOLD_SECONDS and friends, not
+# WATCHDOG_LOG, for every provider) — kept here only so the Azure ML sudo-safe
+# setup below can chown a path it does not otherwise reference.
+WATCHDOG_RUNTIME_LOG_DEFAULT: str = "/var/log/arf_idle_watchdog.log"
 
 # Production idle threshold; smoke tests override with a smaller value (e.g. 300).
 DEFAULT_IDLE_THRESHOLD_SECONDS: int = 3600
@@ -205,6 +210,12 @@ def render_azure_ml_install_script(
     is no creation-time hook. Pipe the output into ``ssh <host> "bash -s"``. Safe to
     re-run: any watchdog already on the box is stopped before the new one launches,
     so repeated acquisitions of the same pool VM never leave two racing.
+
+    Ownership of ``/opt`` and ``/var/log`` varies across pool VMs (root-owned on
+    some, azureuser-writable on others — confirmed both ways during t0055). Try
+    unprivileged first, then fall back to non-interactive sudo (``sudo -n`` never
+    prompts, so a VM with no passwordless sudo fails fast here instead of hanging
+    on a password prompt ``ssh`` has no TTY to answer).
     """
     encoded: str = _encode_watchdog_script()
     terminate_cmd: str = build_azure_ml_terminate_cmd(
@@ -213,11 +224,18 @@ def render_azure_ml_install_script(
         workspace_name=workspace_name,
     )
     env_assignments: str = _config_env_assignments(config=config)
+    whoami_chown: str = 'sudo -n chown "$(whoami)":"$(whoami)"'
     return "\n".join(
         [
             "#!/bin/bash",
             "set -e",
-            f"mkdir -p {WATCHDOG_REMOTE_DIR}",
+            f"mkdir -p {WATCHDOG_REMOTE_DIR} 2>/dev/null || sudo -n mkdir -p {WATCHDOG_REMOTE_DIR}",
+            f"[ -w {WATCHDOG_REMOTE_DIR} ] || {whoami_chown} {WATCHDOG_REMOTE_DIR}",
+            f"touch {WATCHDOG_BOOT_LOG} {WATCHDOG_RUNTIME_LOG_DEFAULT} 2>/dev/null || "
+            f"sudo -n touch {WATCHDOG_BOOT_LOG} {WATCHDOG_RUNTIME_LOG_DEFAULT}",
+            f'[ -w "{WATCHDOG_BOOT_LOG}" ] || {whoami_chown} "{WATCHDOG_BOOT_LOG}"',
+            f'[ -w "{WATCHDOG_RUNTIME_LOG_DEFAULT}" ] || '
+            f'{whoami_chown} "{WATCHDOG_RUNTIME_LOG_DEFAULT}"',
             # Idempotency guard: stop any previous watchdog before installing, so a
             # pool VM acquired repeatedly never accumulates racing timers.
             f"pkill -f {WATCHDOG_REMOTE_NAME} || true",
