@@ -7,7 +7,7 @@ description: >-
 ---
 # Setup Remote Machine
 
-**Version**: 10
+**Version**: 11
 
 ## Goal
 
@@ -334,17 +334,19 @@ Executed during the `teardown` step of execute-task.
    `--vm-name` should be the VM name from the Phase 2 acquire output ($VM_NAME). Without it,
    `teardown` resolves the locked VM by walking the pool over SSH, which cannot find a lock on a VM
    that is currently stopped; `--vm-name` skips that discovery entirely and works even if the VM was
-   already stopped (`teardown` starts it, clears the lock, then leaves it stopped again).
+   already stopped (`teardown` starts it, clears the lock, then leaves it stopped again — even if a
+   sibling lock is present, since a sibling lock on a VM that was stopped is necessarily stale).
    `--acquired-at` should be the `acquired_at` value from the Phase 2 acquire output; it lets the
    provisioner compute `total_duration_hours` and `total_cost_usd`. The output JSON reports
    `deallocated` (true if `az ml compute stop` ran) and `other_locks_present` (true if a sibling
-   task held a lock and the VM was left running).
+   task held a lock; the VM is left running for it only when `teardown` did not itself have to start
+   the VM to clear this task's lock).
 
    **NEVER stop the VM by hand (`az ml compute stop`) instead of calling `teardown`**, even if the
    VM was already stopped for another reason earlier in implementation. `teardown` is the only
    function that clears the on-VM lock file; a manual stop leaves a stale lock that blocks every
    later acquire attempt against that VM until a human clears it — this happened twice in t0055 (see
-   `tasks/t0055_fix_truncation_regenerate_predictions/intervention/ setup_machines_ft-arf-weu-v1.md`).
+   `tasks/t0055_fix_truncation_regenerate_predictions/intervention/setup_machines_ft-arf-weu-v1.md`).
 
 4. Update `machine_log.json`. Use `to_machine_log_entry(acquire_result=..., teardown_result=...)` to
    refresh the entry with `destroyed_at`, `total_duration_hours`, and `total_cost_usd`.

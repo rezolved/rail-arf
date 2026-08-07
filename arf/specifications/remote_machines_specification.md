@@ -1,6 +1,6 @@
 # Remote Machines Specification
 
-**Version**: 7
+**Version**: 8
 
 * * *
 
@@ -526,9 +526,12 @@ cleared before the walk — see `LESSONS.md` Lesson 8.
 a VM by hand bypasses it and leaves a stale lock that blocks every later acquire attempt against
 that VM until a human clears it manually. If the VM to release is already stopped (by hand or by the
 idle watchdog), `teardown()` starts it, clears the lock over SSH, then leaves it stopped again —
-clearing the lock needs SSH, which needs the VM running. Pass `--vm-name <name>` (from this task's
-own `acquire` output) when calling `teardown`; without it, resolving which VM holds the lock walks
-the pool over SSH, which cannot find a lock on a VM that is currently stopped.
+clearing the lock needs SSH, which needs the VM running. This restore happens even if a sibling lock
+is still present, since a sibling lock on a VM that was stopped is necessarily stale — nobody can be
+actively using a stopped VM. The one override is `deallocate=False` (`--keep-running`): an explicit
+request to leave the VM up always wins. Pass `--vm-name <name>` (from this task's own `acquire`
+output) when calling `teardown`; without it, resolving which VM holds the lock walks the pool over
+SSH, which cannot find a lock on a VM that is currently stopped.
 
 * * *
 
