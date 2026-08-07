@@ -86,7 +86,7 @@ REQUIRED_FIELDS: list[str] = [
     FIELD_RATIONALE,
 ]
 
-ALLOWED_SPEC_VERSIONS: set[str] = {"1", "2", "3"}
+ALLOWED_SPEC_VERSIONS: set[str] = {"1", "2", "3", "4"}
 ALLOWED_ACTIONS: set[str] = {
     ACTION_UPDATE,
     ACTION_DELETE,
