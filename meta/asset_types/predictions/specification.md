@@ -157,6 +157,17 @@ Each entry in the `files` list describes one file in the `files/` directory.
 
 * * *
 
+### `parse_ok` Field Convention
+
+`prediction_schema` is free-form, but one per-instance field carries a fixed project-wide meaning
+that producers must not redefine: `parse_ok`. If a project has not implemented automated-parsing
+validation yet, `parse_ok` is an intentional "always false, unused placeholder" reserved for that
+future check — not a producer bug. Describe it with that exact wording (or an equivalent restating
+"always false, unused placeholder") in `prediction_schema` when the field is present, so a reviewer
+or gate-check subagent does not re-flag it as a producer bug.
+
+* * *
+
 ## Description Document
 
 A detailed description of the predictions written after examining the output. The canonical
