@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from arf.scripts.common.task_metrics import (
+    TaskMetricsDocument,
+    TaskMetricsFormatError,
+    normalize_task_metrics_data,
+    parse_metrics_target_id,
+)
 from arf.scripts.verificators.common import paths
 from arf.scripts.verificators.common.json_utils import load_json_file
 
@@ -14,6 +20,7 @@ TARGET_KIND_DATASET: str = "dataset"
 TARGET_KIND_LIBRARY: str = "library"
 TARGET_KIND_MODEL: str = "model"
 TARGET_KIND_PREDICTIONS: str = "predictions"
+TARGET_KIND_METRICS: str = "metrics"
 
 ALL_TARGET_KINDS: set[str] = {
     TARGET_KIND_SUGGESTION,
@@ -23,6 +30,7 @@ ALL_TARGET_KINDS: set[str] = {
     TARGET_KIND_LIBRARY,
     TARGET_KIND_MODEL,
     TARGET_KIND_PREDICTIONS,
+    TARGET_KIND_METRICS,
 }
 
 ASSET_TARGET_KINDS: set[str] = {
@@ -54,6 +62,9 @@ FULL_ANSWER_PATH_FIELD: str = "full_answer_path"
 LIBRARY_FIELD_MODULE_PATHS: str = "module_paths"
 LIBRARY_FIELD_TEST_PATHS: str = "test_paths"
 PAPER_FIELD_FILES: str = "files"
+
+METRICS_PAYLOAD_FIELD_VALUE: str = "value"
+METRICS_PAYLOAD_FIELD_VARIANT_LABEL: str = "variant_label"
 
 DOCUMENT_KIND_DESCRIPTION: str = "description"
 DOCUMENT_KIND_SUMMARY: str = "summary"
@@ -123,6 +134,8 @@ def load_target_record(*, key: TargetKey) -> TargetRecord | None:
         return _load_model_record(key=key)
     if key.target_kind == TARGET_KIND_PREDICTIONS:
         return _load_predictions_record(key=key)
+    if key.target_kind == TARGET_KIND_METRICS:
+        return _load_metrics_record(key=key)
     return None
 
 
@@ -446,6 +459,34 @@ def _load_predictions_record(*, key: TargetKey) -> TargetRecord | None:
             target_kind=TARGET_KIND_PREDICTIONS,
         ),
     )
+
+
+def _load_metrics_record(*, key: TargetKey) -> TargetRecord | None:
+    parsed_target_id = parse_metrics_target_id(target_id=key.target_id)
+    if parsed_target_id is None:
+        return None
+    file_path: Path = paths.metrics_path(task_id=key.task_id)
+    data: dict[str, Any] | None = load_json_file(file_path=file_path)
+    if data is None:
+        return None
+    try:
+        document: TaskMetricsDocument = normalize_task_metrics_data(data=data)
+    except TaskMetricsFormatError:
+        return None
+    for variant in document.variants:
+        if variant.variant_id != parsed_target_id.variant_id:
+            continue
+        if parsed_target_id.metric_key not in variant.metrics:
+            continue
+        return TargetRecord(
+            key=key,
+            payload={
+                METRICS_PAYLOAD_FIELD_VALUE: variant.metrics[parsed_target_id.metric_key],
+                METRICS_PAYLOAD_FIELD_VARIANT_LABEL: variant.label,
+            },
+            file_entries=[],
+        )
+    return None
 
 
 def _build_standard_asset_file_entries(

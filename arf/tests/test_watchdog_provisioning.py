@@ -11,7 +11,10 @@ from arf.scripts.utils.watchdog_provisioning import (
     DEFAULT_IDLE_THRESHOLD_SECONDS,
     VAST_CONTAINER_API_KEY_ENV,
     VAST_SELF_ID_ENV,
+    WATCHDOG_BOOT_LOG,
+    WATCHDOG_REMOTE_DIR,
     WATCHDOG_REMOTE_PATH,
+    WATCHDOG_RUNTIME_LOG_DEFAULT,
     WATCHDOG_SCRIPT_PATH,
     WatchdogConfig,
     build_azure_ml_terminate_cmd,
@@ -218,6 +221,35 @@ def test_azure_ml_install_script_is_idempotent() -> None:
     launch_index: int = script.rindex(WATCHDOG_REMOTE_PATH)
     guard_index: int = min(script.index(marker) for marker in guards)
     assert guard_index < launch_index
+
+
+def test_azure_ml_install_script_creates_opt_and_var_log_sudo_safe() -> None:
+    # S-0055-05 (t0055): /opt and /var/log ownership varies across Azure ML pool
+    # VMs. On FT-ARF-weu-v1/weu-v2, the unprivileged `mkdir -p /opt/arf` and the
+    # log-file writes both failed with "Permission denied" because azureuser did
+    # not own those paths, and had to be worked around by hand with sudo each time.
+    script: str = _render_azure_install_script(config=WatchdogConfig())
+
+    # Try unprivileged first (works on VMs where azureuser already owns the
+    # paths), fall back to non-interactive sudo. `sudo -n` never prompts, so a
+    # VM with no passwordless sudo fails fast instead of hanging with no TTY.
+    assert f"mkdir -p {WATCHDOG_REMOTE_DIR}" in script
+    assert f"sudo -n mkdir -p {WATCHDOG_REMOTE_DIR}" in script
+    assert f"sudo -n touch {WATCHDOG_BOOT_LOG} {WATCHDOG_RUNTIME_LOG_DEFAULT}" in script
+
+    # Every sudo call must be non-interactive.
+    assert script.count("sudo ") == script.count("sudo -n ")
+
+    # chown only runs when the unprivileged path left something unwritable —
+    # confirm both the directory and both log targets are covered.
+    assert f"[ -w {WATCHDOG_REMOTE_DIR} ]" in script
+    for target in (WATCHDOG_BOOT_LOG, WATCHDOG_RUNTIME_LOG_DEFAULT):
+        assert f'sudo -n chown "$(whoami)":"$(whoami)" "{target}"' in script
+
+    # The sudo-safe setup must run before anything writes into those paths.
+    setup_index: int = script.index(f"mkdir -p {WATCHDOG_REMOTE_DIR}")
+    write_index: int = script.index("base64 -d >")
+    assert setup_index < write_index
 
 
 def test_azure_ml_install_script_always_sets_non_empty_terminate_cmd() -> None:

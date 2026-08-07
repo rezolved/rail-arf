@@ -537,12 +537,36 @@ def _try_acquire_one(
     vm: VmPoolEntry,
     task_id: str,
 ) -> tuple[bool, FailedAttempt | None, bool]:
+    """Attempt to acquire ``vm`` for ``task_id``, releasing it if abandoned.
+
+    Wraps ``_attempt_acquire_one``: when that attempt started ``vm`` itself
+    but did not end up acquiring it, this stops the VM again before
+    returning, so a failed acquire never leaves a billing VM for the caller
+    to notice and stop by hand.
+    """
+    acquired, failure, started_vm = _attempt_acquire_one(vm=vm, task_id=task_id)
+    if not acquired and started_vm:
+        stop_result: CommandResult = stop_compute(vm=vm)
+        if stop_result.returncode != 0:
+            sys.stderr.write(
+                f"failed to stop {vm.name} after abandoning a failed acquire attempt: "
+                f"{stop_result.stderr.strip() or stop_result.stdout.strip()}\n",
+            )
+    return acquired, failure, started_vm
+
+
+def _attempt_acquire_one(
+    *,
+    vm: VmPoolEntry,
+    task_id: str,
+) -> tuple[bool, FailedAttempt | None, bool]:
     """Attempt to acquire ``vm`` for ``task_id``.
 
     Returns ``(acquired, failure_record, started_vm)``. When ``acquired`` is
     False, ``failure_record`` describes the reason; ``started_vm`` reports
     whether this attempt issued an az start call (used so the caller can
-    compute wasted cost on giving up).
+    compute wasted cost on giving up, and so ``_try_acquire_one`` knows
+    whether to release the VM it started).
     """
     attempt_start: float = _now_monotonic()
     timestamp: str = _now_iso()
@@ -671,6 +695,16 @@ def _estimate_wasted_cost(*, hourly: float, seconds: float) -> float:
     return hourly * (seconds / 3600.0)
 
 
+def _find_pool_vm(*, pool: list[VmPoolEntry], vm_name: str) -> VmPoolEntry:
+    matched: list[VmPoolEntry] = [vm for vm in pool if vm.name == vm_name]
+    if len(matched) == 0:
+        available: str = ", ".join(vm.name for vm in pool)
+        raise RuntimeError(
+            f"--vm-name {vm_name!r} does not match any VM in pool (available: {available})"
+        )
+    return matched[0]
+
+
 def acquire(
     *,
     task_id: str,
@@ -683,13 +717,7 @@ def acquire(
         raise RuntimeError("VM pool is empty; check project/azure_vm.json")
 
     if vm_name is not None:
-        matched: list[VmPoolEntry] = [vm for vm in pool_to_use if vm.name == vm_name]
-        if len(matched) == 0:
-            available: str = ", ".join(vm.name for vm in pool_to_use)
-            raise RuntimeError(
-                f"--vm-name {vm_name!r} does not match any VM in pool (available: {available})"
-            )
-        pool_to_use = matched
+        pool_to_use = [_find_pool_vm(pool=pool_to_use, vm_name=vm_name)]
 
     search_started_at: str = _now_iso()
     search_started_monotonic: float = _now_monotonic()
@@ -722,6 +750,16 @@ def acquire(
     raise PoolBusyError(f"all VMs in pool unavailable -> {summary}")
 
 
+def _pool_busy_filename(*, failed: list[FailedAttempt]) -> str:
+    # Keyed on the attempted VM name(s) so that parallel subagents provisioning different
+    # --vm-name-pinned VMs for the same task_id each get their own intervention file instead of
+    # overwriting one another's (see t0055's intervention/pool_busy.md note).
+    vm_slugs: list[str] = sorted({f.vm_name.lower() for f in failed})
+    if len(vm_slugs) == 0:
+        return "pool_busy.md"
+    return f"pool_busy_{'_'.join(vm_slugs)}.md"
+
+
 def _write_pool_busy_intervention(
     *,
     task_id: str,
@@ -734,7 +772,7 @@ def _write_pool_busy_intervention(
     else:
         base = POOL_CONFIG_PATH.parent.parent / "tasks" / task_id / "intervention"
     base.mkdir(parents=True, exist_ok=True)
-    path: Path = base / "pool_busy.md"
+    path: Path = base / _pool_busy_filename(failed=failed)
     lines: list[str] = [
         "# Azure ML compute pool busy",
         "",
@@ -870,14 +908,43 @@ def teardown(
 ) -> TeardownResult:
     target_vm: VmPoolEntry = _resolve_locked_vm(task_id=task_id, vm=vm, pool=pool)
 
-    clear_remote_lock(vm=target_vm, task_id=task_id)
+    # Clearing the on-VM lock file needs SSH, which needs the VM running. A VM stopped outside
+    # azure_ml_vm (by hand, or by the idle watchdog) must still be releasable through this one
+    # function -- a hand-stopped VM's stale lock cannot otherwise be cleared and blocks every
+    # later acquire attempt against it.
+    started_from_stopped: bool = get_compute_state(vm=target_vm) == _STATE_STOPPED
+    if started_from_stopped:
+        start_compute(vm=target_vm)
+        start_deadline: float = _now_monotonic() + VM_START_TIMEOUT_SECONDS
+        started_ok: bool = _wait_for_state(
+            vm=target_vm,
+            target=_STATE_RUNNING,
+            deadline=start_deadline,
+        ) and _wait_for_ssh(vm=target_vm, deadline=start_deadline)
+        if not started_ok:
+            raise RuntimeError(
+                f"could not start {target_vm.name} to release task {task_id}'s lock; the VM "
+                "must be reachable over SSH to clear the on-VM lock file",
+            )
+
+    if not clear_remote_lock(vm=target_vm, task_id=task_id):
+        raise RuntimeError(
+            f"failed to clear the lock for {task_id} on {target_vm.name}; the on-VM lock file "
+            "may still be present -- do not treat this task's VM as released",
+        )
     kill_task_vllm_processes(vm=target_vm, task_id=task_id)
 
     other_locks: list[str] = [lock for lock in list_remote_locks(vm=target_vm) if lock != task_id]
     other_locks_present: bool = len(other_locks) > 0
 
+    # Restore the VM to how we found it: if this call started it just to reach it over SSH,
+    # stop it again even when a sibling lock is present -- a sibling lock on a VM that was
+    # stopped is necessarily stale (nobody can be actively using a stopped VM), so it never
+    # protects a live task the way it does when the VM was already running. `deallocate=False`
+    # (the `--keep-running` override) still wins over restoring the original state, since it is
+    # an explicit request to leave the VM up.
     deallocated: bool = False
-    if deallocate and not other_locks_present:
+    if deallocate and (not other_locks_present or started_from_stopped):
         stop_result: CommandResult = stop_compute(vm=target_vm)
         deallocated = stop_result.returncode == 0
 
@@ -1063,6 +1130,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="ISO 8601 timestamp from acquire output (used to compute duration)",
     )
+    teardown_parser.add_argument(
+        "--vm-name",
+        type=str,
+        default=None,
+        help=(
+            "Pin release to a single VM in the pool by name, from this task's own acquire "
+            "output. Without it, resolving the locked VM walks the pool over SSH, which cannot "
+            "find a lock on a VM that is currently stopped (by hand, or by the idle watchdog) "
+            "-- pass this when the VM might be stopped."
+        ),
+    )
 
     run_parser: argparse.ArgumentParser = sub.add_parser(
         "run",
@@ -1087,9 +1165,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "teardown":
         try:
+            pinned_vm: VmPoolEntry | None = None
+            if args.vm_name is not None:
+                pinned_vm = _find_pool_vm(pool=load_pool(), vm_name=args.vm_name)
             t_result: TeardownResult = teardown(
                 task_id=args.task_id,
                 deallocate=not args.keep_running,
+                vm=pinned_vm,
                 acquired_at=args.acquired_at,
             )
         except Exception as err:  # noqa: BLE001

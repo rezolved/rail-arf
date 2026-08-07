@@ -1,6 +1,6 @@
 # Corrections Specification
 
-**Version**: 3
+**Version**: 4
 
 * * *
 
@@ -40,6 +40,7 @@ This version covers these aggregated artifact kinds:
 * `library`
 * `model`
 * `predictions`
+* `metrics` (added in v4)
 
 Correction files do **not** modify raw files in completed task folders. They only change what
 downstream consumers treat as the effective state.
@@ -109,6 +110,33 @@ are immutable.
 | `library` | A library asset in `assets/library/<library_id>/` |
 | `model` | A model asset in `assets/model/<model_id>/` |
 | `predictions` | A predictions asset in `assets/predictions/<predictions_id>/` |
+| `metrics` | A metric entry in `results/metrics.json`, identified by `target_id` (see below) |
+
+### `target_id` for `metrics`
+
+Unlike the asset kinds, a `metrics` target does not live in its own folder — it is one
+`(metric_key, variant_id)` entry inside the target task's `results/metrics.json`. `target_id`
+encodes both parts, joined by `@`:
+
+```text
+<metric_key>@<variant_id>
+```
+
+* `metric_key` is the key exactly as it appears under a variant's `metrics` object (or under the
+  legacy flat `metrics.json` top level).
+* `variant_id` is the variant's `variant_id` field. Legacy flat-format `metrics.json` files have one
+  implicit variant with `variant_id` equal to the empty string, so their `target_id` ends in a
+  trailing `@` (e.g. `targeted_benchmark_score@`).
+
+Examples:
+
+```text
+targeted_benchmark_score@qwen35-base
+two_axis_ab_pass_rate@
+```
+
+Build and parse `target_id` values with `arf.scripts.common.task_metrics.build_metrics_target_id`
+and `parse_metrics_target_id` — never construct or split the string by hand.
 
 ### `action`
 
@@ -140,6 +168,7 @@ artifact kind, except the immutable primary ID:
 * `library`: any `details.json` field except `library_id`
 * `model`: any `details.json` field except `model_id`
 * `predictions`: any `details.json` field except `predictions_id`
+* `metrics`: `value` and/or `variant_label`
 
 For `replace`, `changes` must identify the replacement artifact:
 
@@ -164,7 +193,7 @@ files through aggregators:
 * `model`
 * `predictions`
 
-It is not allowed for `suggestion`.
+It is not allowed for `suggestion` or `metrics` — neither exposes files through an aggregator.
 
 `file_changes` is a JSON object keyed by the logical file path being corrected:
 
@@ -270,6 +299,8 @@ With those rules applied, the effective supported logical file paths are:
 * `predictions`
   * the canonical description document path
   * any path listed in `details.json` `files`
+* `metrics`
+  * none — `metrics` has no files, so `file_changes` is never used for it
 
 For `add`, the target path becomes a new logical file path in the effective artifact.
 
@@ -357,17 +388,54 @@ For `add`, the target path becomes a new logical file path in the effective arti
 }
 ```
 
+### Mark a Metric Compromised Pending Rejudge
+
+````json
+{
+  "spec_version": "4",
+  "correction_id": "C-0056-01",
+  "correcting_task": "t0056_rejudge_truncation_fixed_predictions",
+  "target_task": "t0043_rerun_ft_benchmark_v3_system_prompt",
+  "target_kind": "metrics",
+  "target_id": "targeted_benchmark_score@qwen35-base",
+  "action": "update",
+  "changes": {
+    "value": null
+  },
+  "rationale": "Predictions were regenerated after a truncation fix; score is stale pending rejudge."
+}
+````
+
+### Replace a Metric with a Rejudge Task's Recomputed Score
+
+```json
+{
+  "spec_version": "4",
+  "correction_id": "C-0056-02",
+  "correcting_task": "t0056_rejudge_truncation_fixed_predictions",
+  "target_task": "t0043_rerun_ft_benchmark_v3_system_prompt",
+  "target_kind": "metrics",
+  "target_id": "targeted_benchmark_score@qwen35-base",
+  "action": "replace",
+  "changes": {
+    "replacement_task": "t0056_rejudge_truncation_fixed_predictions",
+    "replacement_id": "targeted_benchmark_score@qwen35-base"
+  },
+  "rationale": "Superseded by the rejudge task's recomputed score against the fixed predictions."
+}
+```
+
 * * *
 
 ## Backward Compatibility
 
-Existing correction files with `spec_version` `"1"` or `"2"` remain valid.
+Existing correction files with `spec_version` `"1"`, `"2"`, or `"3"` remain valid.
 
 Older files use only the subset that existed at the time:
 
-* suggestion metadata updates
-* paper deletion
-* library replacement
+* `spec_version` `"1"`/`"2"`: suggestion metadata updates, paper deletion, library replacement
+* `spec_version` `"3"`: every target kind except `metrics`
+* `spec_version` `"4"`: adds the `metrics` target kind
 
 The verifier accepts legacy versions so completed historical tasks do not need to be modified.
 

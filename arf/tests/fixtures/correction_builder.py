@@ -27,7 +27,7 @@ def build_correction(
     rationale: str = DEFAULT_RATIONALE,
     spec_version: str = SPEC_VERSION_CORRECTION,
 ) -> Path:
-    kinds_without_files: set[str] = {"suggestion"}
+    kinds_without_files: set[str] = {"suggestion", "metrics"}
     data: dict[str, object] = {
         "spec_version": spec_version,
         "correction_id": correction_id,
