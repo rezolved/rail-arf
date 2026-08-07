@@ -345,8 +345,7 @@ Executed during the `teardown` step of execute-task.
    **NEVER stop the VM by hand (`az ml compute stop`) instead of calling `teardown`**, even if the
    VM was already stopped for another reason earlier in implementation. `teardown` is the only
    function that clears the on-VM lock file; a manual stop leaves a stale lock that blocks every
-   later acquire attempt against that VM until a human clears it — this happened twice in t0055 (see
-   `tasks/t0055_fix_truncation_regenerate_predictions/intervention/setup_machines_ft-arf-weu-v1.md`).
+   later acquire attempt against that VM until a human clears it manually.
 
 4. Update `machine_log.json`. Use `to_machine_log_entry(acquire_result=..., teardown_result=...)` to
    refresh the entry with `destroyed_at`, `total_duration_hours`, and `total_cost_usd`.

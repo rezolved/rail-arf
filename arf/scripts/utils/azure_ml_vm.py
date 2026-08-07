@@ -542,9 +542,7 @@ def _try_acquire_one(
     Wraps ``_attempt_acquire_one``: when that attempt started ``vm`` itself
     but did not end up acquiring it, this stops the VM again before
     returning, so a failed acquire never leaves a billing VM for the caller
-    to notice and stop by hand (see
-    ``tasks/t0055_fix_truncation_regenerate_predictions/intervention/
-    setup_machines_ft-arf-weu-v1.md``).
+    to notice and stop by hand.
     """
     acquired, failure, started_vm = _attempt_acquire_one(vm=vm, task_id=task_id)
     if not acquired and started_vm:
@@ -912,8 +910,8 @@ def teardown(
 
     # Clearing the on-VM lock file needs SSH, which needs the VM running. A VM stopped outside
     # azure_ml_vm (by hand, or by the idle watchdog) must still be releasable through this one
-    # function -- see t0055's intervention/setup_machines_ft-arf-weu-v1.md, where a hand-stopped
-    # VM's stale lock could not be cleared and blocked a later task's acquire for days.
+    # function -- a hand-stopped VM's stale lock cannot otherwise be cleared and blocks every
+    # later acquire attempt against it.
     started_from_stopped: bool = get_compute_state(vm=target_vm) == _STATE_STOPPED
     if started_from_stopped:
         start_compute(vm=target_vm)
