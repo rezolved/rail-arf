@@ -18,6 +18,7 @@ import pytest
 
 from arf.scripts.utils import azure_ml_vm
 from arf.scripts.utils.azure_ml_vm import (
+    EXIT_OK,
     EXIT_POOL_BUSY,
     AcquireResult,
     CommandResult,
@@ -272,12 +273,45 @@ def test_acquire_writes_intervention_when_all_busy(
             pool=[PRIMARY, FALLBACK],
             intervention_dir=intervention_dir,
         )
-    intervention_file: Path = intervention_dir / "pool_busy.md"
+    intervention_file: Path = intervention_dir / "pool_busy_ft-nc80-v2_ft-nc80-v3.md"
     assert intervention_file.exists()
     body: str = intervention_file.read_text(encoding="utf-8")
     assert "FT-NC80-v3" in body
     assert "FT-NC80-v2" in body
     assert "someone-else" in body
+
+
+def test_acquire_keys_intervention_path_on_attempted_vm_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Regression for t0055: 4 parallel subagents provisioning different --vm-name-pinned VMs
+    # for the same task_id must not overwrite each other's pool_busy record.
+    w: FakeWorld = FakeWorld(
+        az_state_by_vm={"FT-NC80-v3": "Running", "FT-NC80-v2": "Running"},
+        ssh_ok_by_vm={"FT-NC80-v3": True, "FT-NC80-v2": True},
+        locks_by_vm={"FT-NC80-v3": ["t0054"], "FT-NC80-v2": ["t0052"]},
+        az_calls=[],
+        ssh_calls=[],
+    )
+    _install_fakes(monkeypatch=monkeypatch, world=w)
+    intervention_dir: Path = tmp_path / "intervention"
+    with pytest.raises(PoolBusyError):
+        acquire(
+            task_id="t0055",
+            pool=[PRIMARY],
+            intervention_dir=intervention_dir,
+        )
+    with pytest.raises(PoolBusyError):
+        acquire(
+            task_id="t0055",
+            pool=[FALLBACK],
+            intervention_dir=intervention_dir,
+        )
+    files: list[str] = sorted(p.name for p in intervention_dir.iterdir())
+    assert len(files) == 2
+    assert any("v3" in name.lower() for name in files)
+    assert any("v2" in name.lower() for name in files)
 
 
 def test_acquire_treats_existing_self_lock_as_acquirable(
@@ -299,6 +333,45 @@ def test_acquire_treats_existing_self_lock_as_acquirable(
 # ---------------------------------------------------------------------------
 # teardown
 # ---------------------------------------------------------------------------
+
+
+def test_acquire_stops_vm_it_started_after_discovering_stale_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Regression for t0055's intervention/setup_machines_ft-arf-weu-v1.md: a stopped VM with
+    # a stale foreign lock gets started to check the lock, the lock is found, and the VM must
+    # not be left running -- the caller should never have to stop it by hand.
+    w: FakeWorld = FakeWorld(
+        az_state_by_vm={"FT-NC80-v3": "Stopped"},
+        ssh_ok_by_vm={"FT-NC80-v3": False},
+        locks_by_vm={"FT-NC80-v3": ["stale-task"]},
+        az_calls=[],
+        ssh_calls=[],
+    )
+    _install_fakes(monkeypatch=monkeypatch, world=w)
+    with pytest.raises(PoolBusyError):
+        acquire(task_id="t-new", pool=[PRIMARY], intervention_dir=tmp_path / "intervention")
+    assert w.az_state_by_vm["FT-NC80-v3"] == "Stopped"
+
+
+def test_acquire_leaves_vm_running_when_it_was_already_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A VM that was already running before this attempt touched it must never be stopped by a
+    # failed acquire -- only VMs this attempt itself started are fair game to clean up.
+    w: FakeWorld = FakeWorld(
+        az_state_by_vm={"FT-NC80-v3": "Running"},
+        ssh_ok_by_vm={"FT-NC80-v3": True},
+        locks_by_vm={"FT-NC80-v3": ["someone-else"]},
+        az_calls=[],
+        ssh_calls=[],
+    )
+    _install_fakes(monkeypatch=monkeypatch, world=w)
+    with pytest.raises(PoolBusyError):
+        acquire(task_id="t-new", pool=[PRIMARY], intervention_dir=tmp_path / "intervention")
+    assert w.az_state_by_vm["FT-NC80-v3"] == "Running"
 
 
 def test_teardown_clears_lock_and_stops_when_alone(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -348,6 +421,90 @@ def test_teardown_respects_no_deallocate(monkeypatch: pytest.MonkeyPatch) -> Non
     result = teardown(task_id="t-down", deallocate=False, pool=[PRIMARY])
     assert result.deallocated is False
     assert w.az_state_by_vm["FT-NC80-v3"] == "Running"
+
+
+def test_teardown_starts_a_stopped_vm_to_clear_its_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression for t0055's t0054 stale-lock incident: a VM stopped outside azure_ml_vm (by
+    # hand, or by the idle watchdog) must still be releasable through teardown() -- clearing the
+    # on-VM lock file needs SSH, which needs the VM running.
+    w: FakeWorld = FakeWorld(
+        az_state_by_vm={"FT-NC80-v3": "Stopped"},
+        ssh_ok_by_vm={"FT-NC80-v3": False},
+        locks_by_vm={"FT-NC80-v3": ["t-down"]},
+        az_calls=[],
+        ssh_calls=[],
+    )
+    _install_fakes(monkeypatch=monkeypatch, world=w)
+    result = teardown(task_id="t-down", deallocate=True, vm=PRIMARY, pool=[PRIMARY])
+    assert result.deallocated is True
+    assert "t-down" not in w.locks_by_vm["FT-NC80-v3"]
+    assert w.az_state_by_vm["FT-NC80-v3"] == "Stopped"
+
+
+def test_teardown_raises_when_lock_clear_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A silently-swallowed SSH failure here is exactly the t0054 bug: teardown() must never
+    # report success while the on-VM lock file is still present.
+    w: FakeWorld = FakeWorld(
+        az_state_by_vm={"FT-NC80-v3": "Running"},
+        ssh_ok_by_vm={"FT-NC80-v3": True},
+        locks_by_vm={"FT-NC80-v3": ["t-down"]},
+        az_calls=[],
+        ssh_calls=[],
+    )
+    _install_fakes(monkeypatch=monkeypatch, world=w)
+    monkeypatch.setattr(azure_ml_vm, "clear_remote_lock", lambda **_: False)
+    with pytest.raises(RuntimeError, match="failed to clear the lock"):
+        teardown(task_id="t-down", deallocate=True, vm=PRIMARY, pool=[PRIMARY])
+
+
+def test_cli_teardown_accepts_vm_name_to_bypass_ssh_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Without --vm-name, resolving the locked VM walks the pool over SSH, which cannot find a
+    # lock on a VM that is currently stopped. --vm-name lets a caller (who already knows which
+    # VM from its own acquire output) skip that discovery entirely.
+    w: FakeWorld = FakeWorld(
+        az_state_by_vm={"FT-NC80-v3": "Stopped"},
+        ssh_ok_by_vm={"FT-NC80-v3": False},
+        locks_by_vm={"FT-NC80-v3": ["t-cli-down"]},
+        az_calls=[],
+        ssh_calls=[],
+    )
+    _install_fakes(monkeypatch=monkeypatch, world=w)
+    monkeypatch.setattr(
+        azure_ml_vm,
+        "POOL_CONFIG_PATH",
+        tmp_path / "project" / "azure_vm.json",
+    )
+    (tmp_path / "project").mkdir()
+    (tmp_path / "project" / "azure_vm.json").write_text(
+        json.dumps(
+            {
+                "spec_version": "1",
+                "vms": [
+                    {
+                        "name": "FT-NC80-v3",
+                        "workspace": "finetuning-workspace",
+                        "resource_group": "rezolve-AI",
+                        "ssh_host_alias": "FT-NC80-v3",
+                        "hourly_cost_usd": 13.96,
+                        "priority": 1,
+                        "notes": "",
+                    },
+                ],
+            },
+        ),
+        encoding="utf-8",
+    )
+    exit_code: int = azure_ml_vm.main(
+        ["teardown", "t-cli-down", "--vm-name", "FT-NC80-v3"],
+    )
+    assert exit_code == EXIT_OK
+    assert "t-cli-down" not in w.locks_by_vm["FT-NC80-v3"]
+    out: str = capsys.readouterr().out
+    assert "FT-NC80-v3" in out
 
 
 def test_teardown_computes_duration_and_cost(monkeypatch: pytest.MonkeyPatch) -> None:
