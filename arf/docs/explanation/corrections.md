@@ -41,8 +41,8 @@ see the effective view. The raw view is still there for anyone who needs it.
 
 The correction mechanism targets **aggregated artifacts** — the things skills and humans read
 through aggregators rather than by opening individual task folders. Supported target kinds currently
-include suggestions, papers, answers, datasets, libraries, models, and predictions assets. Metrics
-are corrected through the same mechanism, targeted at the task's results.
+include suggestions, papers, answers, datasets, libraries, models, and predictions assets, plus
+metric entries in a task's `results/metrics.json`, corrected through the same mechanism.
 
 Corrections do not touch raw files inside completed task folders. If an asset's underlying file is
 wrong, a correction can point consumers at a replacement file in the correcting task. The original
