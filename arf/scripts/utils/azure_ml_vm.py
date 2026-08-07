@@ -914,7 +914,8 @@ def teardown(
     # azure_ml_vm (by hand, or by the idle watchdog) must still be releasable through this one
     # function -- see t0055's intervention/setup_machines_ft-arf-weu-v1.md, where a hand-stopped
     # VM's stale lock could not be cleared and blocked a later task's acquire for days.
-    if get_compute_state(vm=target_vm) == _STATE_STOPPED:
+    started_from_stopped: bool = get_compute_state(vm=target_vm) == _STATE_STOPPED
+    if started_from_stopped:
         start_compute(vm=target_vm)
         start_deadline: float = _now_monotonic() + VM_START_TIMEOUT_SECONDS
         started_ok: bool = _wait_for_state(
@@ -938,8 +939,14 @@ def teardown(
     other_locks: list[str] = [lock for lock in list_remote_locks(vm=target_vm) if lock != task_id]
     other_locks_present: bool = len(other_locks) > 0
 
+    # Restore the VM to how we found it: if this call started it just to reach it over SSH,
+    # stop it again even when a sibling lock is present -- a sibling lock on a VM that was
+    # stopped is necessarily stale (nobody can be actively using a stopped VM), so it never
+    # protects a live task the way it does when the VM was already running. `deallocate=False`
+    # (the `--keep-running` override) still wins over restoring the original state, since it is
+    # an explicit request to leave the VM up.
     deallocated: bool = False
-    if deallocate and not other_locks_present:
+    if deallocate and (not other_locks_present or started_from_stopped):
         stop_result: CommandResult = stop_compute(vm=target_vm)
         deallocated = stop_result.returncode == 0
 
