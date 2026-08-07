@@ -441,6 +441,46 @@ def test_teardown_starts_a_stopped_vm_to_clear_its_lock(monkeypatch: pytest.Monk
     assert w.az_state_by_vm["FT-NC80-v3"] == "Stopped"
 
 
+def test_teardown_restops_a_stopped_vm_despite_a_stale_sibling_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A sibling lock found on a VM teardown() itself had to start is necessarily stale --
+    # nobody can be actively using a stopped VM. Regression: previously teardown() reused the
+    # already-running "other_locks_present" guard unconditionally, so it left the VM it just
+    # woke up running forever whenever any stale sibling lock happened to be present.
+    w: FakeWorld = FakeWorld(
+        az_state_by_vm={"FT-NC80-v3": "Stopped"},
+        ssh_ok_by_vm={"FT-NC80-v3": False},
+        locks_by_vm={"FT-NC80-v3": ["t-down", "stale-sibling"]},
+        az_calls=[],
+        ssh_calls=[],
+    )
+    _install_fakes(monkeypatch=monkeypatch, world=w)
+    result = teardown(task_id="t-down", deallocate=True, vm=PRIMARY, pool=[PRIMARY])
+    assert result.deallocated is True
+    assert result.other_locks_present is True
+    assert "t-down" not in w.locks_by_vm["FT-NC80-v3"]
+    assert w.az_state_by_vm["FT-NC80-v3"] == "Stopped"
+
+
+def test_teardown_keep_running_overrides_restoring_a_stopped_vm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # deallocate=False (--keep-running) is an explicit request to leave the VM up; it must win
+    # even over restoring the original stopped state.
+    w: FakeWorld = FakeWorld(
+        az_state_by_vm={"FT-NC80-v3": "Stopped"},
+        ssh_ok_by_vm={"FT-NC80-v3": False},
+        locks_by_vm={"FT-NC80-v3": ["t-down"]},
+        az_calls=[],
+        ssh_calls=[],
+    )
+    _install_fakes(monkeypatch=monkeypatch, world=w)
+    result = teardown(task_id="t-down", deallocate=False, vm=PRIMARY, pool=[PRIMARY])
+    assert result.deallocated is False
+    assert w.az_state_by_vm["FT-NC80-v3"] == "Running"
+
+
 def test_teardown_raises_when_lock_clear_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     # A silently-swallowed SSH failure here is exactly the t0054 bug: teardown() must never
     # report success while the on-VM lock file is still present.
