@@ -7,7 +7,7 @@ description: >-
 ---
 # Setup Remote Machine
 
-**Version**: 9
+**Version**: 10
 
 ## Goal
 
@@ -120,7 +120,9 @@ Read before starting:
    * Exit code `0` — success; JSON on stdout includes `vm_name`, `ssh_host_alias`,
      `hourly_cost_usd`, `acquired_at`, `started_vm`, and `failed_attempts`.
    * Exit code `75` — pool busy; the provisioner has written
-     `tasks/$TASK_ID/intervention/pool_busy.md`. STOP and let the user resolve.
+     `tasks/$TASK_ID/intervention/pool_busy_<vm-name(s)>.md` (keyed on the attempted VM name(s), so
+     parallel subagents provisioning different VMs for this task don't overwrite each other's file).
+     STOP and let the user resolve.
    * Exit code `1` — generic error; surface stderr to the user and STOP.
 
    Between the SSH check and the lock, `acquire` runs `arf/scripts/utils/remote_preflight.sh` on the
@@ -326,13 +328,23 @@ Executed during the `teardown` step of execute-task.
 
    ```bash
    uv run python -m arf.scripts.utils.azure_ml_vm teardown $TASK_ID \
-     --acquired-at $CREATED_AT
+     --vm-name $VM_NAME --acquired-at $CREATED_AT
    ```
 
+   `--vm-name` should be the VM name from the Phase 2 acquire output ($VM_NAME). Without it,
+   `teardown` resolves the locked VM by walking the pool over SSH, which cannot find a lock on a VM
+   that is currently stopped; `--vm-name` skips that discovery entirely and works even if the VM was
+   already stopped (`teardown` starts it, clears the lock, then leaves it stopped again).
    `--acquired-at` should be the `acquired_at` value from the Phase 2 acquire output; it lets the
    provisioner compute `total_duration_hours` and `total_cost_usd`. The output JSON reports
    `deallocated` (true if `az ml compute stop` ran) and `other_locks_present` (true if a sibling
    task held a lock and the VM was left running).
+
+   **NEVER stop the VM by hand (`az ml compute stop`) instead of calling `teardown`**, even if the
+   VM was already stopped for another reason earlier in implementation. `teardown` is the only
+   function that clears the on-VM lock file; a manual stop leaves a stale lock that blocks every
+   later acquire attempt against that VM until a human clears it — this happened twice in t0055 (see
+   `tasks/t0055_fix_truncation_regenerate_predictions/intervention/ setup_machines_ft-arf-weu-v1.md`).
 
 4. Update `machine_log.json`. Use `to_machine_log_entry(acquire_result=..., teardown_result=...)` to
    refresh the entry with `destroyed_at`, `total_duration_hours`, and `total_cost_usd`.

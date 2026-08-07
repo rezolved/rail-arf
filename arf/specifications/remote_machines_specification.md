@@ -1,6 +1,6 @@
 # Remote Machines Specification
 
-**Version**: 6
+**Version**: 7
 
 * * *
 
@@ -504,18 +504,31 @@ no offer marketplace and no price negotiation — every VM in the pool bills at 
 1. Read `project/azure_vm.json`. Each entry has a `priority` (1 = primary), `vm_name`, `region`,
    `workspace`, `resource_group`, `gpu`, `gpu_count`, and `hourly_cost_usd`.
 2. Iterate entries in ascending `priority`. For each VM:
-   * Check whether `~/.arf-locks/<other_task_id>.lock` exists on the VM via SSH. If a lock owned by
-     another task is present, record `lock_held` in `failed_attempts` and continue to the next
-     entry.
    * If stopped, issue `az ml compute start`. Wait up to 8 minutes for the VM to reach `Running`.
    * Verify SSH connectivity via the host alias declared in the user's `~/.ssh/config`.
+   * Check whether `~/.arf-locks/<other_task_id>.lock` exists on the VM via SSH. If a lock owned by
+     another task is present, record `lock_held` in `failed_attempts`, **stop the VM again if this
+     attempt is the one that started it** (never leave a VM billing that this walk started but did
+     not end up using), and continue to the next entry.
    * On success, write `~/.arf-locks/<task_id>.lock` and return.
-3. If every entry is locked or unreachable, write `tasks/<task_id>/intervention/pool_busy.md` and
-   exit non-zero.
+3. If every entry is locked or unreachable, write
+   `tasks/<task_id>/intervention/pool_busy_<vm-name(s)>.md`, keyed on the lowercased name(s) of the
+   VM(s) this call attempted, and exit non-zero. Keying on the VM name(s) lets parallel subagents
+   provisioning different `--vm-name`-pinned VMs for the same `task_id` each keep their own
+   intervention file instead of overwriting one another's.
 
 The whole walk, including `failed_attempts` for any VMs skipped on the way to the chosen one, is
 recorded in `machine_log.json`. Stale locks (owned by tasks already in a terminal state) should be
 cleared before the walk — see `LESSONS.md` Lesson 8.
+
+**Releasing a lock is always `azure_ml_vm teardown`, never a manual `az ml compute stop`.**
+`teardown()` is the only function that clears the on-VM lock file (`clear_remote_lock()`); stopping
+a VM by hand bypasses it and leaves a stale lock that blocks every later acquire attempt against
+that VM until a human clears it manually. If the VM to release is already stopped (by hand or by the
+idle watchdog), `teardown()` starts it, clears the lock over SSH, then leaves it stopped again —
+clearing the lock needs SSH, which needs the VM running. Pass `--vm-name <name>` (from this task's
+own `acquire` output) when calling `teardown`; without it, resolving which VM holds the lock walks
+the pool over SSH, which cannot find a lock on a VM that is currently stopped.
 
 * * *
 
