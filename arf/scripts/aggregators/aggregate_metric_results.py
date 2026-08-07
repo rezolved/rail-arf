@@ -1,10 +1,11 @@
 """Aggregate metric values across all tasks.
 
 Walks task folders, reads results/metrics.json, normalizes both
-legacy flat and explicit variant formats, and groups metric values
-by metric key.
+legacy flat and explicit variant formats, applies the `metrics`
+corrections overlay, and groups the effective metric values by
+metric key.
 
-Aggregator version: 2
+Aggregator version: 3
 """
 
 import argparse
@@ -26,10 +27,27 @@ from arf.scripts.aggregators.common.cli import (
     add_output_format_arg,
 )
 from arf.scripts.aggregators.common.filtering import matches_ids
+from arf.scripts.common.artifacts import (
+    METRICS_PAYLOAD_FIELD_VALUE,
+    METRICS_PAYLOAD_FIELD_VARIANT_LABEL,
+    TARGET_KIND_METRICS,
+    TargetKey,
+)
+from arf.scripts.common.corrections import (
+    EffectiveTargetRecord,
+    build_correction_index,
+    dedupe_effective_records,
+    discover_corrections,
+    load_effective_target_record,
+    resolve_target,
+)
 from arf.scripts.common.task_metrics import (
+    MetricsTargetId,
     TaskMetricsDocument,
     TaskMetricsFormatError,
+    build_metrics_target_id,
     normalize_task_metrics_data,
+    parse_metrics_target_id,
 )
 from arf.scripts.verificators.common.json_utils import load_json_file
 from arf.scripts.verificators.common.paths import TASKS_DIR, metrics_path
@@ -45,12 +63,6 @@ class MetricResultEntry:
     variant_id: str
     variant_label: str | None
     value: float | int | bool | str | None
-
-
-@dataclass(frozen=True, slots=True)
-class TaskMetricEntry:
-    metric_key: str
-    entry: MetricResultEntry
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,58 +100,99 @@ def _discover_task_ids() -> list[str]:
     )
 
 
-def _load_task_metric_entries(
+def _discover_raw_metric_target_keys() -> list[TargetKey]:
+    keys: list[TargetKey] = []
+    for task_id in _discover_task_ids():
+        file_path = metrics_path(task_id=task_id)
+        data: dict[str, Any] | None = load_json_file(file_path=file_path)
+        if data is None:
+            continue
+        try:
+            document: TaskMetricsDocument = normalize_task_metrics_data(data=data)
+        except TaskMetricsFormatError:
+            continue
+        for variant in document.variants:
+            for metric_key in variant.metrics:
+                keys.append(
+                    TargetKey(
+                        task_id=task_id,
+                        target_kind=TARGET_KIND_METRICS,
+                        target_id=build_metrics_target_id(
+                            metric_key=metric_key,
+                            variant_id=variant.variant_id,
+                        ),
+                    ),
+                )
+    return keys
+
+
+def _entry_from_effective_record(
     *,
-    task_id: str,
-) -> list[TaskMetricEntry]:
-    file_path = metrics_path(task_id=task_id)
-    data: dict[str, Any] | None = load_json_file(file_path=file_path)
-    if data is None:
-        return []
-
-    try:
-        document: TaskMetricsDocument = normalize_task_metrics_data(data=data)
-    except TaskMetricsFormatError:
-        return []
-
+    record: EffectiveTargetRecord,
+    variant_id: str,
+) -> MetricResultEntry:
     type _ScalarValue = float | int | bool | str | None
 
-    entries: list[TaskMetricEntry] = []
-    for variant in document.variants:
-        for metric_key, raw_value in variant.metrics.items():
-            scalar_value: _ScalarValue
-            if isinstance(raw_value, float | int | bool | str) or raw_value is None:
-                scalar_value = raw_value
-            else:
-                scalar_value = None
-            entry: MetricResultEntry = MetricResultEntry(
-                task_id=task_id,
-                variant_id=variant.variant_id,
-                variant_label=variant.label,
-                value=scalar_value,
-            )
-            entries.append(
-                TaskMetricEntry(metric_key=metric_key, entry=entry),
-            )
-    return entries
+    raw_value: object = record.payload.get(METRICS_PAYLOAD_FIELD_VALUE)
+    value: _ScalarValue
+    if isinstance(raw_value, float | int | bool | str) or raw_value is None:
+        value = raw_value
+    else:
+        value = None
+
+    raw_label: object = record.payload.get(METRICS_PAYLOAD_FIELD_VARIANT_LABEL)
+    variant_label: str | None = raw_label if isinstance(raw_label, str) else None
+
+    return MetricResultEntry(
+        task_id=record.effective_key.task_id,
+        variant_id=variant_id,
+        variant_label=variant_label,
+        value=value,
+    )
 
 
 def _collect_all_entries(
     *,
     filter_task_ids: list[str] | None = None,
 ) -> dict[str, list[MetricResultEntry]]:
-    task_ids: list[str] = _discover_task_ids()
-    grouped: dict[str, list[MetricResultEntry]] = {}
-    for task_id in task_ids:
-        if not matches_ids(asset_id=task_id, filter_ids=filter_task_ids):
+    correction_index = build_correction_index(
+        correction_specs=discover_corrections(),
+    )
+    effective_records: list[EffectiveTargetRecord] = []
+    for original_key in _discover_raw_metric_target_keys():
+        if not matches_ids(asset_id=original_key.task_id, filter_ids=filter_task_ids):
             continue
-        task_entries: list[TaskMetricEntry] = _load_task_metric_entries(
-            task_id=task_id,
+        resolution = resolve_target(
+            original_key=original_key,
+            correction_index=correction_index,
         )
-        for task_entry in task_entries:
-            if task_entry.metric_key not in grouped:
-                grouped[task_entry.metric_key] = []
-            grouped[task_entry.metric_key].append(task_entry.entry)
+        if resolution.deleted:
+            continue
+        record: EffectiveTargetRecord | None = load_effective_target_record(
+            resolution=resolution,
+            correction_index=correction_index,
+        )
+        if record is not None:
+            effective_records.append(record)
+    deduped_records: list[EffectiveTargetRecord] = dedupe_effective_records(
+        records=effective_records,
+    )
+
+    grouped: dict[str, list[MetricResultEntry]] = {}
+    for record in deduped_records:
+        parsed_target_id: MetricsTargetId | None = parse_metrics_target_id(
+            target_id=record.effective_key.target_id,
+        )
+        if parsed_target_id is None:
+            continue
+        if parsed_target_id.metric_key not in grouped:
+            grouped[parsed_target_id.metric_key] = []
+        grouped[parsed_target_id.metric_key].append(
+            _entry_from_effective_record(
+                record=record,
+                variant_id=parsed_target_id.variant_id,
+            ),
+        )
     return grouped
 
 
