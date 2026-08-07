@@ -31,6 +31,8 @@ SNAKE_CASE_PATTERN: re.Pattern[str] = re.compile(
     r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
 )
 
+METRICS_TARGET_ID_SEPARATOR: str = "@"
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -52,6 +54,12 @@ class TaskMetricsDocument:
     variants: list[TaskMetricVariant]
 
 
+@dataclass(frozen=True, slots=True)
+class MetricsTargetId:
+    metric_key: str
+    variant_id: str
+
+
 class TaskMetricsFormatError(ValueError):
     """Raised when a task metrics payload cannot be normalized."""
 
@@ -59,6 +67,19 @@ class TaskMetricsFormatError(ValueError):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def build_metrics_target_id(*, metric_key: str, variant_id: str) -> str:
+    return f"{metric_key}{METRICS_TARGET_ID_SEPARATOR}{variant_id}"
+
+
+def parse_metrics_target_id(*, target_id: str) -> MetricsTargetId | None:
+    if METRICS_TARGET_ID_SEPARATOR not in target_id:
+        return None
+    metric_key, _, variant_id = target_id.partition(METRICS_TARGET_ID_SEPARATOR)
+    if len(metric_key) == 0:
+        return None
+    return MetricsTargetId(metric_key=metric_key, variant_id=variant_id)
 
 
 def is_scalar_metric_value(*, value: object) -> bool:
